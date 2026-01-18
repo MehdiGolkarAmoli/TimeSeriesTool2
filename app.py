@@ -72,6 +72,12 @@ from tqdm import tqdm
 SPECTRAL_BANDS = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12']
 PATCH_SIZE = 224
 
+# Download settings
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 2  # seconds (exponential backoff: 2, 4, 8...)
+DOWNLOAD_TIMEOUT = 120  # seconds per band
+CHUNK_SIZE = 8192
+
 # =============================================================================
 # Session State Initialization
 # =============================================================================
@@ -93,6 +99,18 @@ if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
 if 'data_summary' not in st.session_state:
     st.session_state.data_summary = None
+
+# Progress tracking and caching
+if 'processed_months' not in st.session_state:
+    st.session_state.processed_months = {}  # {month_name: thumbnail_data}
+if 'failed_months' not in st.session_state:
+    st.session_state.failed_months = []  # List of months that failed
+if 'current_temp_dir' not in st.session_state:
+    st.session_state.current_temp_dir = None
+if 'processing_in_progress' not in st.session_state:
+    st.session_state.processing_in_progress = False
+if 'last_processed_index' not in st.session_state:
+    st.session_state.last_processed_index = 0
 
 # =============================================================================
 # Model Download Functions (from Document 1)
@@ -521,47 +539,127 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     return final_collection, total_months
 
 # =============================================================================
-# Download Monthly Image from GEE
+# Download Monthly Image from GEE (with retry mechanism)
 # =============================================================================
-def download_monthly_image(image, aoi, month_name, temp_dir):
+def download_band_with_retry(image, band, aoi, output_path, scale=10):
     """
-    Download a single monthly Sentinel-2 composite from GEE.
+    Download a single band with retry mechanism and exponential backoff.
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    region = aoi.bounds().getInfo()['coordinates']
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            url = image.select(band).getDownloadURL({
+                'scale': scale,
+                'region': region,
+                'format': 'GEO_TIFF',
+                'bands': [band]
+            })
+            
+            response = requests.get(
+                url, 
+                stream=True, 
+                timeout=DOWNLOAD_TIMEOUT
+            )
+            
+            if response.status_code == 200:
+                # Check content type to ensure it's not an error page
+                content_type = response.headers.get('content-type', '')
+                if 'text/html' in content_type:
+                    raise Exception("Received HTML instead of GeoTIFF - possible rate limit")
+                
+                # Download with progress
+                with open(output_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                        if chunk:
+                            f.write(chunk)
+                
+                # Verify file was created and has content
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 100:
+                    return True
+                else:
+                    raise Exception("Downloaded file is empty or too small")
+            else:
+                raise Exception(f"HTTP {response.status_code}")
+                
+        except requests.exceptions.Timeout:
+            st.warning(f"⏱️ Timeout downloading {band} (attempt {attempt + 1}/{MAX_RETRIES})")
+        except requests.exceptions.ConnectionError:
+            st.warning(f"🔌 Connection error downloading {band} (attempt {attempt + 1}/{MAX_RETRIES})")
+        except Exception as e:
+            st.warning(f"⚠️ Error downloading {band}: {str(e)} (attempt {attempt + 1}/{MAX_RETRIES})")
+        
+        # Exponential backoff before retry
+        if attempt < MAX_RETRIES - 1:
+            wait_time = RETRY_DELAY_BASE ** (attempt + 1)
+            st.info(f"⏳ Waiting {wait_time}s before retry...")
+            time.sleep(wait_time)
+    
+    return False
+
+
+def download_monthly_image(image, aoi, month_name, temp_dir, scale=10, status_placeholder=None):
+    """
+    Download a single monthly Sentinel-2 composite from GEE with retry mechanism.
+    
+    Args:
+        image: ee.Image to download
+        aoi: ee.Geometry area of interest
+        month_name: str name of the month (e.g., "2023-06")
+        temp_dir: str path to temporary directory
+        scale: int resolution in meters (10 or 20)
+        status_placeholder: Streamlit placeholder for status updates
     
     Returns:
         str: Path to downloaded GeoTIFF or None if failed
     """
     try:
         output_file = os.path.join(temp_dir, f"sentinel2_{month_name}.tif")
+        
+        # Check if already downloaded
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
+            if status_placeholder:
+                status_placeholder.info(f"✅ {month_name} already downloaded, using cached file")
+            return output_file
+        
         bands_dir = os.path.join(temp_dir, f"bands_{month_name}")
         os.makedirs(bands_dir, exist_ok=True)
         
-        # Get the region bounds for download
-        region = aoi.bounds().getInfo()['coordinates']
-        
         band_files = []
+        failed_bands = []
         
-        for band in SPECTRAL_BANDS:
+        for i, band in enumerate(SPECTRAL_BANDS):
             band_file = os.path.join(bands_dir, f"{band}.tif")
             
-            url = image.select(band).getDownloadURL({
-                'scale': 10,
-                'region': region,
-                'format': 'GEO_TIFF',
-                'bands': [band]
-            })
+            if status_placeholder:
+                status_placeholder.text(f"📥 {month_name}: Downloading {band} ({i+1}/{len(SPECTRAL_BANDS)})...")
             
-            response = requests.get(url, stream=True, timeout=60)
-            if response.status_code == 200:
-                with open(band_file, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
+            # Check if band already downloaded
+            if os.path.exists(band_file) and os.path.getsize(band_file) > 100:
+                band_files.append(band_file)
+                continue
+            
+            # Download with retry
+            success = download_band_with_retry(image, band, aoi, band_file, scale)
+            
+            if success:
                 band_files.append(band_file)
             else:
-                return None
+                failed_bands.append(band)
+        
+        # Check if all bands were downloaded
+        if failed_bands:
+            st.error(f"❌ {month_name}: Failed to download bands: {', '.join(failed_bands)}")
+            return None
         
         # Create multiband GeoTIFF
         if len(band_files) == len(SPECTRAL_BANDS):
+            if status_placeholder:
+                status_placeholder.text(f"📦 {month_name}: Creating multiband GeoTIFF...")
+            
             with rasterio.open(band_files[0]) as src:
                 meta = src.meta.copy()
             
@@ -577,7 +675,7 @@ def download_monthly_image(image, aoi, month_name, temp_dir):
             return None
         
     except Exception as e:
-        st.warning(f"Error downloading {month_name}: {str(e)}")
+        st.error(f"❌ Error downloading {month_name}: {str(e)}")
         return None
 
 # =============================================================================
@@ -699,16 +797,24 @@ def generate_classification_thumbnail(classification_mask, month_name):
         return None
 
 # =============================================================================
-# Process Time Series - Main Function
+# Process Time Series - Main Function (with resume capability)
 # =============================================================================
-def process_timeseries_classification(final_collection, aoi, model, device):
+def process_timeseries_classification(final_collection, aoi, model, device, scale=10, resume=False):
     """
     Process the entire time series: download, classify, and create thumbnails.
+    Supports resume from where it stopped.
+    
+    Args:
+        final_collection: ee.ImageCollection of monthly composites
+        aoi: ee.Geometry area of interest
+        model: PyTorch model for classification
+        device: torch device
+        scale: int resolution in meters (10 or 20)
+        resume: bool whether to resume from previous progress
     
     Returns:
         list: List of classification thumbnail data
     """
-    thumbnails = []
     
     try:
         # Get collection info
@@ -723,62 +829,135 @@ def process_timeseries_classification(final_collection, aoi, model, device):
         
         st.success(f"✅ Found {num_images} monthly composites to process")
         
-        # Create temp directory
-        temp_dir = tempfile.mkdtemp()
+        # Create or reuse temp directory
+        if st.session_state.current_temp_dir is None or not os.path.exists(st.session_state.current_temp_dir):
+            st.session_state.current_temp_dir = tempfile.mkdtemp()
+        temp_dir = st.session_state.current_temp_dir
+        
+        st.info(f"📁 Working directory: {temp_dir}")
+        
+        # Determine starting point
+        if resume and st.session_state.processed_months:
+            # Collect already processed months
+            already_processed = set(st.session_state.processed_months.keys())
+            st.info(f"🔄 Resuming... {len(already_processed)} months already processed")
+        else:
+            already_processed = set()
+            st.session_state.processed_months = {}
+            st.session_state.failed_months = []
         
         # Progress tracking
         progress_bar = st.progress(0)
         status_text = st.empty()
+        detail_text = st.empty()
+        
+        # Statistics
+        stats_container = st.container()
         
         image_list = final_collection.toList(num_images)
+        
+        processed_count = len(already_processed)
+        failed_count = 0
+        skipped_count = 0
+        
+        st.session_state.processing_in_progress = True
         
         for idx in range(num_images):
             try:
                 month_name = features[idx]['properties'].get('month_name', f'Month {idx+1}')
+                
+                # Skip if already processed
+                if month_name in already_processed:
+                    skipped_count += 1
+                    progress_bar.progress((idx + 1) / num_images)
+                    continue
+                
                 status_text.text(f"🔄 Processing {month_name} ({idx+1}/{num_images})...")
                 
                 # Get the image
                 img = ee.Image(image_list.get(idx))
                 
-                # Download the image
-                status_text.text(f"📥 Downloading {month_name}...")
-                image_path = download_monthly_image(img, aoi, month_name, temp_dir)
+                # Download the image with retry
+                detail_text.text(f"📥 Downloading {month_name} at {scale}m resolution...")
+                image_path = download_monthly_image(
+                    img, aoi, month_name, temp_dir, 
+                    scale=scale, 
+                    status_placeholder=detail_text
+                )
                 
                 if image_path is None:
-                    st.warning(f"⚠️ Failed to download {month_name}, skipping...")
+                    st.warning(f"⚠️ Failed to download {month_name} after {MAX_RETRIES} retries")
+                    st.session_state.failed_months.append(month_name)
+                    failed_count += 1
+                    progress_bar.progress((idx + 1) / num_images)
                     continue
                 
                 # Classify the image
-                status_text.text(f"🧠 Classifying {month_name}...")
+                detail_text.text(f"🧠 Classifying {month_name}...")
                 classification_mask = classify_monthly_image(image_path, model, device, month_name)
                 
                 if classification_mask is None:
-                    st.warning(f"⚠️ Failed to classify {month_name}, skipping...")
+                    st.warning(f"⚠️ Failed to classify {month_name}")
+                    st.session_state.failed_months.append(month_name)
+                    failed_count += 1
+                    progress_bar.progress((idx + 1) / num_images)
                     continue
                 
                 # Create thumbnail
                 thumbnail_data = generate_classification_thumbnail(classification_mask, month_name)
                 
                 if thumbnail_data:
-                    thumbnails.append(thumbnail_data)
+                    # Save to session state cache
+                    st.session_state.processed_months[month_name] = thumbnail_data
+                    processed_count += 1
                 
                 # Update progress
                 progress_bar.progress((idx + 1) / num_images)
                 
+                # Update statistics display
+                with stats_container:
+                    st.write(f"✅ Processed: {processed_count} | ❌ Failed: {failed_count} | ⏭️ Skipped: {skipped_count}")
+                
+                # Store last processed index for potential resume
+                st.session_state.last_processed_index = idx
+                
                 # Small delay to avoid overwhelming the API
-                time.sleep(0.2)
+                time.sleep(0.3)
                 
             except Exception as e:
-                st.warning(f"⚠️ Error processing image {idx+1}: {str(e)}")
+                st.warning(f"⚠️ Error processing {month_name}: {str(e)}")
+                st.session_state.failed_months.append(month_name)
+                failed_count += 1
                 continue
+        
+        st.session_state.processing_in_progress = False
         
         # Clear progress indicators
         status_text.empty()
+        detail_text.empty()
         progress_bar.empty()
+        
+        # Convert processed_months dict to sorted list
+        thumbnails = []
+        for month_name in sorted(st.session_state.processed_months.keys()):
+            thumbnails.append(st.session_state.processed_months[month_name])
+        
+        # Final summary
+        st.success(f"""
+        **Processing Complete!**
+        - ✅ Successfully processed: {processed_count} months
+        - ❌ Failed: {failed_count} months
+        - ⏭️ Skipped (already done): {skipped_count} months
+        """)
+        
+        if st.session_state.failed_months:
+            st.warning(f"Failed months: {', '.join(st.session_state.failed_months)}")
+            st.info("💡 You can click 'Resume Processing' to retry failed months")
         
         return thumbnails
         
     except Exception as e:
+        st.session_state.processing_in_progress = False
         st.error(f"Error processing time series: {str(e)}")
         import traceback
         st.error(traceback.format_exc())
@@ -917,6 +1096,38 @@ def main():
         step=0.1,
         help="Cloud Displacement Index threshold for cloud detection"
     )
+    
+    # =========================================================================
+    # Sidebar - Download Settings
+    # =========================================================================
+    st.sidebar.header("📥 Download Settings")
+    
+    # Fixed resolution at 10m
+    download_resolution = 10
+    st.sidebar.info("📏 Resolution: 10m (full resolution)")
+    
+    # =========================================================================
+    # Sidebar - Cache Management
+    # =========================================================================
+    st.sidebar.header("🗂️ Cache Management")
+    
+    if st.session_state.processed_months:
+        st.sidebar.success(f"✅ {len(st.session_state.processed_months)} months cached")
+        
+        if st.sidebar.button("🗑️ Clear Cache", help="Clear all cached downloads and results"):
+            st.session_state.processed_months = {}
+            st.session_state.failed_months = []
+            st.session_state.classification_thumbnails = []
+            st.session_state.processing_complete = False
+            st.session_state.current_temp_dir = None
+            st.session_state.last_processed_index = 0
+            st.sidebar.success("Cache cleared!")
+            st.rerun()
+    else:
+        st.sidebar.info("No cached data")
+    
+    if st.session_state.failed_months:
+        st.sidebar.warning(f"❌ {len(st.session_state.failed_months)} failed months")
     
     # =========================================================================
     # Region Selection
@@ -1068,9 +1279,54 @@ def main():
         selected_polygon = st.session_state.last_drawn_polygon
         st.info("Using the last drawn polygon (not saved)")
     
-    # Process button
-    if st.button("🚀 Generate Building Classifications", type="primary"):
+    # Show current progress if any
+    if st.session_state.processed_months:
+        st.info(f"📊 Current progress: {len(st.session_state.processed_months)} months processed")
+        if st.session_state.failed_months:
+            st.warning(f"⚠️ {len(st.session_state.failed_months)} months failed: {', '.join(st.session_state.failed_months)}")
+    
+    # Action buttons
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        start_new = st.button("🚀 Start New Processing", type="primary", 
+                              help="Clear cache and start fresh")
+    
+    with col2:
+        resume_processing = st.button("🔄 Resume Processing", 
+                                      disabled=not st.session_state.processed_months,
+                                      help="Continue from where it stopped")
+    
+    with col3:
+        retry_failed = st.button("🔁 Retry Failed", 
+                                 disabled=not st.session_state.failed_months,
+                                 help="Retry only the failed months")
+    
+    # Process based on button clicked
+    should_process = False
+    resume_mode = False
+    
+    if start_new:
+        should_process = True
+        resume_mode = False
+        # Clear previous results
+        st.session_state.processed_months = {}
+        st.session_state.failed_months = []
+        st.session_state.classification_thumbnails = []
+        st.session_state.processing_complete = False
+        st.session_state.current_temp_dir = None
         
+    elif resume_processing:
+        should_process = True
+        resume_mode = True
+        
+    elif retry_failed:
+        should_process = True
+        resume_mode = True
+        # Clear failed list but keep processed months
+        st.session_state.failed_months = []
+    
+    if should_process:
         if selected_polygon is None:
             st.error("❌ Please select a region of interest first!")
             st.stop()
@@ -1078,11 +1334,6 @@ def main():
         if not st.session_state.model_loaded:
             st.error("❌ Model not loaded!")
             st.stop()
-        
-        # Clear previous results
-        st.session_state.classification_thumbnails = []
-        st.session_state.processing_complete = False
-        st.session_state.data_summary = None
         
         # Convert polygon to GEE geometry
         geojson = {"type": "Polygon", "coordinates": [list(selected_polygon.exterior.coords)]}
@@ -1104,6 +1355,7 @@ def main():
                 )
                 
                 st.success("✅ Cloud-free composites created!")
+                st.session_state.data_summary = {'total_months': total_months}
                 
             except Exception as e:
                 st.error(f"❌ Error creating composites: {str(e)}")
@@ -1111,31 +1363,26 @@ def main():
                 st.error(traceback.format_exc())
                 st.stop()
         
-        with st.spinner("🧠 Processing images with building detection model..."):
-            try:
-                # Process and classify
-                thumbnails = process_timeseries_classification(
-                    final_collection, 
-                    aoi, 
-                    st.session_state.model, 
-                    st.session_state.device
-                )
-                
-                if thumbnails:
-                    st.session_state.classification_thumbnails = thumbnails
-                    st.session_state.processing_complete = True
-                    st.session_state.data_summary = {
-                        'total_months': total_months,
-                        'months_processed': len(thumbnails)
-                    }
-                    st.success(f"✅ Successfully classified {len(thumbnails)} monthly images!")
-                else:
-                    st.warning("No classifications were generated.")
-                    
-            except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
-                import traceback
-                st.error(traceback.format_exc())
+        # Process and classify
+        st.info(f"📥 Download resolution: {download_resolution}m")
+        
+        thumbnails = process_timeseries_classification(
+            final_collection, 
+            aoi, 
+            st.session_state.model, 
+            st.session_state.device,
+            scale=download_resolution,
+            resume=resume_mode
+        )
+        
+        if thumbnails:
+            st.session_state.classification_thumbnails = thumbnails
+            st.session_state.processing_complete = True
+            if st.session_state.data_summary:
+                st.session_state.data_summary['months_processed'] = len(thumbnails)
+            st.success(f"✅ Successfully classified {len(thumbnails)} monthly images!")
+        else:
+            st.warning("No classifications were generated.")
     
     # =========================================================================
     # Display Results
