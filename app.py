@@ -364,6 +364,9 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     Create gap-filled monthly Sentinel-2 composites.
     Uses only M-1 and M+1 for gap-filling.
     
+    IMPORTANT: Only returns images that are COMPLETELY cloud-free after gap-filling.
+    Images with ANY remaining masked pixels are excluded.
+    
     Returns:
         tuple: (final_collection, total_months)
     """
@@ -496,22 +499,29 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
         still_masked = gap_mask.And(has_fill.Not())
         
         filled = curr.select(SPECTRAL_BANDS).unmask(mosaic.updateMask(fill_mask))
-        fill_source = (ee.Image.constant(0).clip(aoi).toInt8()
-                       .where(fill_mask, 1)
-                       .where(still_masked, 2)
-                       .rename('fill_source'))
         
-        return (filled.addBands(freq)
-                .addBands(fill_source)
+        # Create a band that tracks remaining masked pixels
+        # 0 = has data, 1 = still masked after gap-filling
+        remaining_mask_band = (ee.Image.constant(0).clip(aoi).toInt8()
+                               .where(still_masked, 1)
+                               .rename('remaining_mask'))
+        
+        return (filled
+                .addBands(freq)
+                .addBands(remaining_mask_band)
                 .set('month_name', curr.get('month_name'))
+                .set('was_gapfilled', True)
                 .copyProperties(curr, ['system:time_start', 'month_index', 'has_data']))
     
     def prepare_complete(month_idx):
         curr = ee.Image(monthly_list_updated.get(month_idx))
+        # For complete months, remaining_mask is all zeros (no masked pixels)
+        remaining_mask_band = ee.Image.constant(0).clip(aoi).toInt8().rename('remaining_mask')
         return (curr.select(SPECTRAL_BANDS)
                 .addBands(curr.select('frequency'))
-                .addBands(ee.Image.constant(0).clip(aoi).toInt8().rename('fill_source'))
+                .addBands(remaining_mask_band)
                 .set('month_name', curr.get('month_name'))
+                .set('was_gapfilled', False)
                 .copyProperties(curr, ['system:time_start', 'month_index', 'has_data']))
     
     # Process all months
@@ -528,13 +538,64 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     
     processed_list = ee.List(month_indices.map(process_month)).removeAll([None])
     
-    # Create final collection
-    final_collection = ee.ImageCollection.fromImages(processed_list.map(
-        lambda img: ee.Image(img).select(SPECTRAL_BANDS).toDouble()
-            .set('system:index', ee.Image(img).get('month_name'))
-            .set('month_name', ee.Image(img).get('month_name'))
-            .set('was_gapfilled', ee.Image(img).propertyNames().contains('fill_source'))
-    ))
+    # =========================================================================
+    # CRITICAL: Check each image for remaining masked pixels and exclude them
+    # =========================================================================
+    def check_and_finalize_image(img):
+        """
+        Check if image has ANY remaining masked pixels.
+        Add a property 'is_complete' = True only if NO masked pixels remain.
+        """
+        img = ee.Image(img)
+        remaining_mask = img.select('remaining_mask')
+        
+        # Sum all remaining_mask values - if > 0, there are still masked pixels
+        mask_sum = remaining_mask.reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi,
+            scale=10,
+            maxPixels=1e9
+        ).get('remaining_mask')
+        
+        # Also check if any pixel in the spectral bands is masked
+        # by checking if all pixels have valid data
+        valid_pixel_count = img.select('B4').mask().reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi,
+            scale=10,
+            maxPixels=1e9
+        ).get('B4')
+        
+        total_pixel_count = ee.Image.constant(1).clip(aoi).reduceRegion(
+            reducer=ee.Reducer.count(),
+            geometry=aoi,
+            scale=10,
+            maxPixels=1e9
+        ).get('constant')
+        
+        # Image is complete only if:
+        # 1. No remaining_mask pixels (mask_sum == 0)
+        # 2. All pixels have valid data (valid_pixel_count == total_pixel_count)
+        is_complete = ee.Number(mask_sum).eq(0).And(
+            ee.Number(valid_pixel_count).eq(total_pixel_count)
+        )
+        
+        return (img.select(SPECTRAL_BANDS).toDouble()
+                .set('system:index', img.get('month_name'))
+                .set('month_name', img.get('month_name'))
+                .set('was_gapfilled', img.get('was_gapfilled'))
+                .set('is_complete', is_complete)
+                .set('valid_pixel_count', valid_pixel_count)
+                .set('total_pixel_count', total_pixel_count)
+                .set('remaining_masked_pixels', mask_sum))
+    
+    # Apply the check to all processed images
+    checked_collection = ee.ImageCollection.fromImages(
+        processed_list.map(check_and_finalize_image)
+    )
+    
+    # Filter to only include complete images (no masked pixels)
+    final_collection = checked_collection.filter(ee.Filter.eq('is_complete', True))
     
     return final_collection, total_months
 
@@ -681,6 +742,49 @@ def download_monthly_image(image, aoi, month_name, temp_dir, scale=10, status_pl
 # =============================================================================
 # Classification Functions (from Document 1)
 # =============================================================================
+def verify_image_complete(image_path, month_name):
+    """
+    Verify that a downloaded image has NO NaN or masked pixels.
+    
+    Returns:
+        tuple: (is_complete: bool, message: str)
+    """
+    try:
+        with rasterio.open(image_path) as src:
+            # Check each band for NaN or nodata values
+            nodata = src.nodata
+            
+            for band_idx in range(1, src.count + 1):
+                band_data = src.read(band_idx)
+                
+                # Check for NaN values
+                nan_count = np.sum(np.isnan(band_data))
+                if nan_count > 0:
+                    return False, f"Band {band_idx} has {nan_count} NaN pixels"
+                
+                # Check for nodata values
+                if nodata is not None:
+                    nodata_count = np.sum(band_data == nodata)
+                    if nodata_count > 0:
+                        return False, f"Band {band_idx} has {nodata_count} nodata pixels"
+                
+                # Check for zero values (which might indicate masked areas in Sentinel-2)
+                # Note: Some bands might legitimately have zero values, so we check all bands
+                zero_count = np.sum(band_data == 0)
+                total_pixels = band_data.size
+                zero_percentage = (zero_count / total_pixels) * 100
+                
+                # If more than 5% of pixels are zero, it might indicate masked areas
+                # But we only warn, not fail, as some zero values might be legitimate
+                if zero_percentage > 50:
+                    return False, f"Band {band_idx} has {zero_percentage:.1f}% zero pixels (likely masked)"
+            
+            return True, "Image is complete with no masked pixels"
+            
+    except Exception as e:
+        return False, f"Error verifying image: {str(e)}"
+
+
 def classify_monthly_image(image_path, model, device, month_name):
     """
     Apply the building detection model to a monthly Sentinel-2 image.
@@ -690,6 +794,12 @@ def classify_monthly_image(image_path, model, device, month_name):
         numpy.ndarray: Binary classification mask or None if failed
     """
     try:
+        # First verify the image is complete
+        is_complete, verify_msg = verify_image_complete(image_path, month_name)
+        if not is_complete:
+            st.warning(f"⚠️ {month_name}: {verify_msg}")
+            return None
+        
         with rasterio.open(image_path) as src:
             img_data = src.read()  # Shape: (bands, height, width)
             meta = src.meta.copy()
@@ -1354,8 +1464,31 @@ def main():
                     cdi_threshold=cdi_threshold
                 )
                 
-                st.success("✅ Cloud-free composites created!")
-                st.session_state.data_summary = {'total_months': total_months}
+                # Get the count of complete images (no masked pixels)
+                complete_count = final_collection.size().getInfo()
+                excluded_count = total_months - complete_count
+                
+                st.success(f"✅ Cloud-free composites created!")
+                st.info(f"""
+                📊 **Image Quality Summary:**
+                - Total months requested: {total_months}
+                - Complete images (no masked pixels): {complete_count}
+                - Excluded images (still have masked pixels after gap-filling): {excluded_count}
+                """)
+                
+                if complete_count == 0:
+                    st.error("❌ No complete images available for the selected time period and region!")
+                    st.warning("Try: Increasing cloud cover %, selecting a different time period, or choosing a smaller region.")
+                    st.stop()
+                
+                if excluded_count > 0:
+                    st.warning(f"⚠️ {excluded_count} months were excluded because they still have masked pixels after gap-filling.")
+                
+                st.session_state.data_summary = {
+                    'total_months': total_months,
+                    'complete_months': complete_count,
+                    'excluded_months': excluded_count
+                }
                 
             except Exception as e:
                 st.error(f"❌ Error creating composites: {str(e)}")
@@ -1392,13 +1525,23 @@ def main():
         
         # Display data summary
         if st.session_state.data_summary:
-            total = st.session_state.data_summary['total_months']
-            processed = st.session_state.data_summary['months_processed']
-            st.success(f"✅ {processed} months classified from {total} months in the selected period.")
+            total = st.session_state.data_summary.get('total_months', 0)
+            complete = st.session_state.data_summary.get('complete_months', 0)
+            excluded = st.session_state.data_summary.get('excluded_months', 0)
+            processed = st.session_state.data_summary.get('months_processed', len(st.session_state.classification_thumbnails))
+            
+            st.success(f"""
+            **📊 Processing Summary:**
+            - Total months in time period: {total}
+            - Complete images available (no masked pixels): {complete}
+            - Excluded (still had masked pixels): {excluded}
+            - Successfully classified: {processed}
+            """)
         
         # Display thumbnails
         st.subheader("📅 Monthly Building Classifications")
         st.caption("White = Buildings detected | Black = No buildings | Percentage shows building coverage")
+        st.caption("⚠️ Only months with 100% valid pixels (no clouds/masks) are shown")
         display_classification_thumbnails(st.session_state.classification_thumbnails)
 
 # =============================================================================
