@@ -354,7 +354,7 @@ def normalized(img):
     return img_norm
 
 # =============================================================================
-# GEE Processing Functions (from Document 2, modified)
+# GEE Processing Functions (matching JavaScript logic)
 # =============================================================================
 def create_gapfilled_timeseries(aoi, start_date, end_date, 
                                  cloudy_pixel_percentage=10,
@@ -362,13 +362,16 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
                                  cdi_threshold=-0.5):
     """
     Create gap-filled monthly Sentinel-2 composites.
-    Uses only M-1 and M+1 for gap-filling.
     
-    IMPORTANT: Only returns images that are COMPLETELY cloud-free after gap-filling.
-    Images with ANY remaining masked pixels are excluded.
+    Gap-filling strategy: CLOSEST TIME INTERVAL (M-1, M+1, M-2)
+    - Collect cloud-free images from 3 adjacent months
+    - Sort by time distance from middle of current month
+    - Use closest cloud-free pixel first
+    
+    Only returns images that are COMPLETELY cloud-free (0% masked pixels).
     
     Returns:
-        tuple: (final_collection, total_months)
+        tuple: (final_collection, total_months, complete_count)
     """
     
     # Date calculations
@@ -380,7 +383,8 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     end_date_ee = ee.Date(end_date)
     num_months = ee.Number(total_months)
     
-    extended_start = start_date_ee.advance(-1, 'month')
+    # Extended date range for gap-filling (2 months before, 1 month after)
+    extended_start = start_date_ee.advance(-2, 'month')
     extended_end = end_date_ee.advance(1, 'month')
     
     # Load collections
@@ -403,199 +407,272 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     
     # Cloud masking function
     def mask_clouds(img):
-        is_cloud = img.select('probability').gt(cloud_probability_threshold).And(
-            ee.Algorithms.Sentinel2.CDI(img).lt(cdi_threshold)
-        )
-        cloud_dilated = is_cloud.focal_max(kernel=ee.Kernel.circle(20, 'meters'), iterations=2)
-        return (img.updateMask(cloud_dilated.Not())
-                .select(SPECTRAL_BANDS)
-                .multiply(0.0001)
-                .clip(aoi)
-                .copyProperties(img, ['system:time_start']))
+        cloud_prob = img.select('probability')
+        cdi = ee.Algorithms.Sentinel2.CDI(img)
+        is_cloud = cloud_prob.gt(cloud_probability_threshold).And(cdi.lt(cdi_threshold))
+        kernel = ee.Kernel.circle(radius=20, units='meters')
+        cloud_dilated = is_cloud.focal_max(kernel=kernel, iterations=2)
+        masked = img.updateMask(cloud_dilated.Not())
+        scaled = masked.select(SPECTRAL_BANDS).multiply(0.0001).clip(aoi)
+        return scaled.copyProperties(img, ['system:time_start'])
     
-    cloud_free = s2_joined.map(mask_clouds)
+    cloud_free_collection = s2_joined.map(mask_clouds)
     
-    # Create monthly composites
+    # Create monthly composites with frequency tracking
     origin = ee.Date(start_date)
-    empty_img = (ee.Image.constant(ee.List.repeat(0, len(SPECTRAL_BANDS)))
-                 .rename(SPECTRAL_BANDS)
-                 .toFloat()
-                 .updateMask(ee.Image.constant(0)))
     
-    def create_monthly(i):
+    empty_image = (ee.Image.constant(ee.List.repeat(0, len(SPECTRAL_BANDS)))
+                   .rename(SPECTRAL_BANDS)
+                   .toFloat()
+                   .updateMask(ee.Image.constant(0)))
+    
+    def create_monthly_composite(i):
         i = ee.Number(i)
-        m_start = origin.advance(i, 'month')
-        m_end = origin.advance(i.add(1), 'month')
-        monthly = cloud_free.filterDate(m_start, m_end)
-        count = monthly.size()
+        month_start = origin.advance(i, 'month')
+        month_end = origin.advance(i.add(1), 'month')
+        month_middle = month_start.advance(15, 'day')
         
-        freq = ee.Image(ee.Algorithms.If(
-            count.gt(0),
-            monthly.map(lambda img: ee.Image(1).updateMask(img.select('B4').mask()).unmask(0).toInt()).sum().toInt(),
+        monthly_images = cloud_free_collection.filterDate(month_start, month_end)
+        image_count = monthly_images.size()
+        
+        # Frequency map: count of valid observations per pixel
+        frequency_map = ee.Image(ee.Algorithms.If(
+            image_count.gt(0),
+            monthly_images.map(lambda img: 
+                ee.Image(1).updateMask(img.select('B4').mask()).unmask(0).toInt()
+            ).sum().toInt(),
             ee.Image.constant(0).toInt().clip(aoi)
         )).rename('frequency')
         
-        composite = ee.Image(ee.Algorithms.If(count.gt(0), monthly.median(), empty_img.clip(aoi)))
+        # Monthly composite (median)
+        monthly_composite = ee.Image(ee.Algorithms.If(
+            image_count.gt(0),
+            monthly_images.median(),
+            empty_image.clip(aoi)
+        ))
         
-        return (composite.addBands(freq)
-                .addBands(freq.gt(0).rename('validity_mask'))
-                .set('system:time_start', m_start.millis())
+        # Validity mask
+        validity_mask = frequency_map.gt(0).rename('validity_mask')
+        
+        # Count masked pixels (where frequency == 0)
+        masked_pixel_count = ee.Algorithms.If(
+            image_count.gt(0),
+            frequency_map.eq(0).reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=aoi,
+                scale=10,
+                maxPixels=1e13
+            ).get('frequency'),
+            0
+        )
+        
+        return (monthly_composite
+                .addBands(frequency_map)
+                .addBands(validity_mask)
+                .set('system:time_start', month_start.millis())
+                .set('system:time_end', month_end.millis())
+                .set('month_middle', month_middle.millis())
                 .set('month_index', i)
-                .set('month_name', m_start.format('YYYY-MM'))
-                .set('image_count', count)
-                .set('has_data', count.gt(0)))
+                .set('month_name', month_start.format('YYYY-MM'))
+                .set('image_count', image_count)
+                .set('has_data', image_count.gt(0))
+                .set('masked_pixel_count', masked_pixel_count))
     
-    monthly_composites = ee.ImageCollection(ee.List.sequence(0, num_months.subtract(1)).map(create_monthly))
+    # Create all monthly composites
+    monthly_composites = ee.ImageCollection(
+        ee.List.sequence(0, num_months.subtract(1)).map(create_monthly_composite)
+    )
     monthly_list = monthly_composites.toList(num_months)
     month_indices = ee.List.sequence(0, num_months.subtract(1))
     
-    # Check which months have masked pixels
-    def check_has_gaps(img):
-        freq = img.select('frequency')
-        min_freq = freq.reduceRegion(
-            reducer=ee.Reducer.min(),
-            geometry=aoi,
-            scale=10,
-            maxPixels=1e9
-        ).get('frequency')
-        has_gaps = ee.Number(min_freq).eq(0)
-        return img.set('has_masked_pixels', has_gaps)
+    # Identify months with data
+    months_with_data = month_indices.map(lambda i: 
+        ee.Algorithms.If(
+            ee.Image(monthly_list.get(i)).get('has_data'),
+            i,
+            None
+        )
+    ).removeAll([None])
     
-    monthly_with_gap_info = monthly_composites.map(check_has_gaps)
-    monthly_list_updated = monthly_with_gap_info.toList(num_months)
+    # =========================================================================
+    # GAP-FILLING: CLOSEST TIME INTERVAL (M-1, M+1, M-2)
+    # =========================================================================
     
-    # Gap-filling function (M-1 and M+1 only)
-    def gap_fill(month_idx):
-        month_idx = ee.Number(month_idx)
-        curr = ee.Image(monthly_list_updated.get(month_idx))
-        freq = curr.select('frequency')
-        gap_mask = freq.eq(0)
+    def gap_fill_month_closest(month_index):
+        """
+        Gap-fill using closest time interval strategy.
+        1. Collect all cloud-free images from M-1, M+1, M-2
+        2. Calculate time distance from middle of current month
+        3. Sort by absolute time distance (closest first)
+        4. Mosaic: first valid pixel wins (closest in time)
+        """
+        month_index = ee.Number(month_index)
         
-        m_start = origin.advance(month_idx, 'month')
-        m_end = origin.advance(month_idx.add(1), 'month')
-        m_mid_millis = m_start.advance(15, 'day').millis()
+        current_img = ee.Image(monthly_list.get(month_index))
+        original_spectral = current_img.select(SPECTRAL_BANDS)
+        frequency = current_img.select('frequency')
+        validity_mask = current_img.select('validity_mask')
         
-        candidates = (cloud_free.filterDate(origin.advance(month_idx.subtract(1), 'month'), m_start)
-            .merge(cloud_free.filterDate(m_end, origin.advance(month_idx.add(2), 'month'))))
+        # Gap mask: pixels with no data (frequency == 0)
+        gap_mask = frequency.eq(0)
         
-        sorted_candidates = candidates.map(
-            lambda img: img.set('time_dist', ee.Number(img.get('system:time_start')).subtract(m_mid_millis).abs())
-        ).sort('time_dist', True)
+        # Current month boundaries
+        current_month_start = origin.advance(month_index, 'month')
+        current_month_end = origin.advance(month_index.add(1), 'month')
         
-        empty = (ee.Image.constant(ee.List.repeat(0, len(SPECTRAL_BANDS)))
-                 .rename(SPECTRAL_BANDS)
-                 .toFloat()
-                 .updateMask(ee.Image.constant(0))
-                 .clip(aoi))
+        # Middle of current month (for time distance calculation)
+        month_middle_millis = current_month_start.advance(15, 'day').millis()
         
-        mosaic = ee.Image(ee.Algorithms.If(
-            sorted_candidates.size().gt(0),
-            sorted_candidates.mosaic().select(SPECTRAL_BANDS),
-            empty
+        # Define search ranges for M-1, M+1, M-2
+        m1_past_start = origin.advance(month_index.subtract(1), 'month')
+        m1_past_end = current_month_start
+        
+        m1_future_start = current_month_end
+        m1_future_end = origin.advance(month_index.add(2), 'month')
+        
+        m2_past_start = origin.advance(month_index.subtract(2), 'month')
+        m2_past_end = m1_past_start
+        
+        # Empty image template
+        empty_spectral = (ee.Image.constant(ee.List.repeat(0, len(SPECTRAL_BANDS)))
+                         .rename(SPECTRAL_BANDS)
+                         .toFloat()
+                         .updateMask(ee.Image.constant(0))
+                         .clip(aoi))
+        
+        # Collect images from M-1, M+1, M-2
+        m1_past_images = cloud_free_collection.filterDate(m1_past_start, m1_past_end)
+        m1_future_images = cloud_free_collection.filterDate(m1_future_start, m1_future_end)
+        m2_past_images = cloud_free_collection.filterDate(m2_past_start, m2_past_end)
+        
+        # Merge all candidate images
+        all_candidate_images = m1_past_images.merge(m1_future_images).merge(m2_past_images)
+        
+        # Add time distance property to each image
+        def add_time_distance(img):
+            img_time = ee.Number(img.get('system:time_start'))
+            time_diff = img_time.subtract(month_middle_millis).abs()
+            return img.set('time_distance', time_diff)
+        
+        images_with_distance = all_candidate_images.map(add_time_distance)
+        
+        # Sort by time distance (closest first)
+        sorted_images = images_with_distance.sort('time_distance', True)
+        
+        # Create mosaic: first valid pixel wins (closest in time)
+        closest_mosaic = ee.Image(ee.Algorithms.If(
+            sorted_images.size().gt(0),
+            sorted_images.mosaic().select(SPECTRAL_BANDS),
+            empty_spectral
         ))
         
-        has_fill = mosaic.select('B4').mask()
-        fill_mask = gap_mask.And(has_fill)
-        still_masked = gap_mask.And(has_fill.Not())
+        has_closest = closest_mosaic.select('B4').mask()
         
-        filled = curr.select(SPECTRAL_BANDS).unmask(mosaic.updateMask(fill_mask))
+        # Apply gap-filling
+        fill_from_closest = gap_mask.And(has_closest)
+        still_masked = gap_mask.And(has_closest.Not())
         
-        # Create a band that tracks remaining masked pixels
-        # 0 = has data, 1 = still masked after gap-filling
-        remaining_mask_band = (ee.Image.constant(0).clip(aoi).toInt8()
-                               .where(still_masked, 1)
-                               .rename('remaining_mask'))
+        filled_spectral = original_spectral.unmask(closest_mosaic.updateMask(fill_from_closest))
         
-        return (filled
-                .addBands(freq)
-                .addBands(remaining_mask_band)
-                .set('month_name', curr.get('month_name'))
-                .set('was_gapfilled', True)
-                .copyProperties(curr, ['system:time_start', 'month_index', 'has_data']))
+        # Fill source: 0=original, 1=filled from closest, 2=still masked
+        fill_source = (ee.Image.constant(0).clip(aoi).toInt8()
+                       .where(fill_from_closest, 1)
+                       .where(still_masked, 2)
+                       .rename('fill_source'))
+        
+        new_validity_mask = filled_spectral.select('B4').mask().rename('filled_validity_mask')
+        
+        return (filled_spectral
+                .addBands(frequency)
+                .addBands(validity_mask)
+                .addBands(new_validity_mask)
+                .addBands(fill_source)
+                .set('gap_filled', True)
+                .set('processed', True)
+                .copyProperties(current_img, current_img.propertyNames()))
     
-    def prepare_complete(month_idx):
-        curr = ee.Image(monthly_list_updated.get(month_idx))
-        # For complete months, remaining_mask is all zeros (no masked pixels)
-        remaining_mask_band = ee.Image.constant(0).clip(aoi).toInt8().rename('remaining_mask')
-        return (curr.select(SPECTRAL_BANDS)
-                .addBands(curr.select('frequency'))
-                .addBands(remaining_mask_band)
-                .set('month_name', curr.get('month_name'))
-                .set('was_gapfilled', False)
-                .copyProperties(curr, ['system:time_start', 'month_index', 'has_data']))
+    def prepare_complete_month(month_index):
+        """Prepare a month that already has complete data (no gaps)."""
+        month_index = ee.Number(month_index)
+        
+        current_img = ee.Image(monthly_list.get(month_index))
+        frequency = current_img.select('frequency')
+        validity_mask = current_img.select('validity_mask')
+        
+        fill_source = ee.Image.constant(0).clip(aoi).toInt8().rename('fill_source')
+        
+        return (current_img.select(SPECTRAL_BANDS)
+                .addBands(frequency)
+                .addBands(validity_mask)
+                .addBands(validity_mask.rename('filled_validity_mask'))
+                .addBands(fill_source)
+                .set('gap_filled', False)
+                .set('processed', True)
+                .copyProperties(current_img, current_img.propertyNames()))
     
-    # Process all months
+    # Process all months with data
     def process_month(i):
-        img = ee.Image(monthly_list_updated.get(i))
+        img = ee.Image(monthly_list.get(i))
         has_data = ee.Number(img.get('has_data'))
-        has_gaps = img.get('has_masked_pixels')
+        masked_count = ee.Number(img.get('masked_pixel_count'))
         
         return ee.Algorithms.If(
-            has_data.And(has_gaps),
-            gap_fill(i),
-            ee.Algorithms.If(has_data, prepare_complete(i), None)
+            has_data.Not(),
+            None,  # No data - skip
+            ee.Algorithms.If(
+                masked_count.gt(0),
+                gap_fill_month_closest(i),  # Needs gap-filling
+                prepare_complete_month(i)   # Already complete
+            )
         )
     
-    processed_list = ee.List(month_indices.map(process_month)).removeAll([None])
+    processed_months_list = month_indices.map(process_month)
     
     # =========================================================================
-    # CRITICAL: Check each image for remaining masked pixels and exclude them
+    # FILTER TO ONLY COMPLETE MONTHS (0% masked after gap-filling)
     # =========================================================================
-    def check_and_finalize_image(img):
-        """
-        Check if image has ANY remaining masked pixels.
-        Add a property 'is_complete' = True only if NO masked pixels remain.
-        """
-        img = ee.Image(img)
-        remaining_mask = img.select('remaining_mask')
+    
+    def check_if_complete(i):
+        """Check if a processed month has 0 still-masked pixels."""
+        img = ee.Image(ee.List(processed_months_list).get(i))
         
-        # Sum all remaining_mask values - if > 0, there are still masked pixels
-        mask_sum = remaining_mask.reduceRegion(
-            reducer=ee.Reducer.sum(),
-            geometry=aoi,
-            scale=10,
-            maxPixels=1e9
-        ).get('remaining_mask')
-        
-        # Also check if any pixel in the spectral bands is masked
-        # by checking if all pixels have valid data
-        valid_pixel_count = img.select('B4').mask().reduceRegion(
-            reducer=ee.Reducer.sum(),
-            geometry=aoi,
-            scale=10,
-            maxPixels=1e9
-        ).get('B4')
-        
-        total_pixel_count = ee.Image.constant(1).clip(aoi).reduceRegion(
-            reducer=ee.Reducer.count(),
-            geometry=aoi,
-            scale=10,
-            maxPixels=1e9
-        ).get('constant')
-        
-        # Image is complete only if:
-        # 1. No remaining_mask pixels (mask_sum == 0)
-        # 2. All pixels have valid data (valid_pixel_count == total_pixel_count)
-        is_complete = ee.Number(mask_sum).eq(0).And(
-            ee.Number(valid_pixel_count).eq(total_pixel_count)
+        # Handle null images (months without data)
+        return ee.Algorithms.If(
+            ee.Algorithms.IsEqual(img, None),
+            None,
+            # Check fill_source band for still-masked pixels (value == 2)
+            ee.Algorithms.If(
+                img.bandNames().contains('fill_source'),
+                # Count still-masked pixels
+                ee.Algorithms.If(
+                    ee.Number(
+                        img.select('fill_source').eq(2).reduceRegion(
+                            reducer=ee.Reducer.sum(),
+                            geometry=aoi,
+                            scale=10,
+                            maxPixels=1e13
+                        ).get('fill_source')
+                    ).eq(0),
+                    i,  # Complete - return index
+                    None  # Still has masked pixels - skip
+                ),
+                None
+            )
         )
-        
+    
+    complete_month_indices = months_with_data.map(check_if_complete).removeAll([None])
+    
+    # Create final collection with only complete months
+    def get_complete_image(i):
+        img = ee.Image(ee.List(processed_months_list).get(i))
         return (img.select(SPECTRAL_BANDS).toDouble()
                 .set('system:index', img.get('month_name'))
                 .set('month_name', img.get('month_name'))
-                .set('was_gapfilled', img.get('was_gapfilled'))
-                .set('is_complete', is_complete)
-                .set('valid_pixel_count', valid_pixel_count)
-                .set('total_pixel_count', total_pixel_count)
-                .set('remaining_masked_pixels', mask_sum))
+                .set('was_gapfilled', img.get('gap_filled')))
     
-    # Apply the check to all processed images
-    checked_collection = ee.ImageCollection.fromImages(
-        processed_list.map(check_and_finalize_image)
+    final_collection = ee.ImageCollection.fromImages(
+        complete_month_indices.map(get_complete_image)
     )
-    
-    # Filter to only include complete images (no masked pixels)
-    final_collection = checked_collection.filter(ee.Filter.eq('is_complete', True))
     
     return final_collection, total_months
 
