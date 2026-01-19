@@ -3,15 +3,16 @@ Sentinel-2 Time Series Building Classification
 A Streamlit application for viewing building classification results 
 from cloud-free Sentinel-2 monthly composites using a UNet++ deep learning model.
 
-VERSION 03 CHANGES:
+VERSION 04 FIXES:
+- FIXED: Removed 0.0001 scaling in GEE (now matches working app)
+- FIXED: Normalization now happens per-patch globally (all bands together)
+- FIXED: Cache validation with .tmp file approach
 - Added RGB thumbnail display alongside classification masks
-- Fixed cache validation to detect corrupted/partial downloads
-- Added file integrity verification using rasterio
 
 Workflow:
 1. Generate cloud-free monthly composites on GEE
-2. Download each monthly image locally (12 bands)
-3. Apply patching → Model inference → Reconstruction
+2. Download each monthly image locally (12 bands) - RAW DN VALUES
+3. Apply patching → Normalize per-patch → Model inference → Reconstruction
 4. Display RGB + classification thumbnails (binary masks)
 """
 
@@ -47,12 +48,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message="Examining the path of torch.classes")
 
-# =============================================================================
-# Now import streamlit as the first streamlit-related import
-# =============================================================================
 import streamlit as st
 
-# Set page configuration - MUST BE THE FIRST STREAMLIT COMMAND
 st.set_page_config(
     layout="wide", 
     page_title="Building Classification Time Series",
@@ -69,19 +66,19 @@ SPECTRAL_BANDS = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', '
 PATCH_SIZE = 224
 
 # RGB bands for visualization (True Color: B4=Red, B3=Green, B2=Blue)
-RGB_BANDS = {'red': 'B4', 'green': 'B3', 'blue': 'B2'}
 RGB_BAND_INDICES = {'red': 3, 'green': 2, 'blue': 1}  # 0-indexed positions in SPECTRAL_BANDS
 
 # Download settings
 MAX_RETRIES = 3
-RETRY_DELAY_BASE = 2  # seconds (exponential backoff: 2, 4, 8...)
-DOWNLOAD_TIMEOUT = 120  # seconds per band
+RETRY_DELAY_BASE = 2
+DOWNLOAD_TIMEOUT = 120
 CHUNK_SIZE = 8192
 
-# Minimum expected file sizes for validation (in bytes)
-MIN_BAND_FILE_SIZE = 10000  # 10KB minimum for a valid band file
-MIN_MULTIBAND_FILE_SIZE = 100000  # 100KB minimum for multiband GeoTIFF
+# Minimum expected file sizes for validation
+MIN_BAND_FILE_SIZE = 10000
+MIN_MULTIBAND_FILE_SIZE = 100000
 
+# Session state initialization
 if 'drawn_polygons' not in st.session_state:
     st.session_state.drawn_polygons = []
 if 'last_drawn_polygon' not in st.session_state:
@@ -100,12 +97,10 @@ if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
 if 'data_summary' not in st.session_state:
     st.session_state.data_summary = None
-
-# Progress tracking and caching
 if 'processed_months' not in st.session_state:
-    st.session_state.processed_months = {}  # {month_name: thumbnail_data}
+    st.session_state.processed_months = {}
 if 'failed_months' not in st.session_state:
-    st.session_state.failed_months = []  # List of months that failed
+    st.session_state.failed_months = []
 if 'current_temp_dir' not in st.session_state:
     st.session_state.current_temp_dir = None
 if 'processing_in_progress' not in st.session_state:
@@ -113,20 +108,36 @@ if 'processing_in_progress' not in st.session_state:
 if 'last_processed_index' not in st.session_state:
     st.session_state.last_processed_index = 0
 
+
 # =============================================================================
-# File Integrity Validation Functions (NEW)
+# FIXED: Normalization function - matches working app exactly
 # =============================================================================
-def validate_geotiff_file(file_path, expected_bands=1):
+def normalized(img):
     """
-    Validate that a GeoTIFF file is complete and readable.
+    Normalize image data to range [0, 1]
+    This normalizes the ENTIRE array globally (all bands together)
     
-    Args:
-        file_path: Path to the GeoTIFF file
-        expected_bands: Expected number of bands
+    Parameters:
+    img (numpy.ndarray): Input image (can be 2D or 3D)
     
     Returns:
-        tuple: (is_valid: bool, message: str)
+    numpy.ndarray: Normalized image with values in [0, 1]
     """
+    min_val = np.nanmin(img)
+    max_val = np.nanmax(img)
+    
+    if max_val == min_val:
+        return np.zeros_like(img)
+    
+    img_norm = (img - min_val) / (max_val - min_val)
+    return img_norm
+
+
+# =============================================================================
+# File Validation Functions
+# =============================================================================
+def validate_geotiff_file(file_path, expected_bands=1):
+    """Validate that a GeoTIFF file is complete and readable."""
     try:
         if not os.path.exists(file_path):
             return False, "File does not exist"
@@ -137,19 +148,13 @@ def validate_geotiff_file(file_path, expected_bands=1):
         if file_size < min_size:
             return False, f"File too small ({file_size} bytes, expected > {min_size})"
         
-        # Try to open and read the file with rasterio
         with rasterio.open(file_path) as src:
-            # Check band count
             if src.count < expected_bands:
                 return False, f"Wrong band count ({src.count}, expected {expected_bands})"
             
-            # Try to read a small portion of each band to verify data integrity
             for band_idx in range(1, min(src.count + 1, expected_bands + 1)):
-                # Read first 10x10 pixels as a quick integrity check
                 window = rasterio.windows.Window(0, 0, min(10, src.width), min(10, src.height))
                 data = src.read(band_idx, window=window)
-                
-                # Check for all-NaN data (indicates corrupted file)
                 if np.all(np.isnan(data)):
                     return False, f"Band {band_idx} contains only NaN values"
         
@@ -162,12 +167,7 @@ def validate_geotiff_file(file_path, expected_bands=1):
 
 
 def validate_band_file(band_file_path, band_name):
-    """
-    Validate a single band GeoTIFF file.
-    
-    Returns:
-        tuple: (is_valid: bool, message: str)
-    """
+    """Validate a single band GeoTIFF file."""
     return validate_geotiff_file(band_file_path, expected_bands=1)
 
 
@@ -176,24 +176,18 @@ def validate_band_file(band_file_path, band_name):
 # =============================================================================
 @st.cache_data
 def download_model_from_gdrive(gdrive_url, local_filename):
-    """
-    Download a file from Google Drive using the sharing URL with improved error handling
-    """
+    """Download a file from Google Drive with improved error handling"""
     try:
-        # File ID from the URL
         correct_file_id = "1m6EScw-mpBIvWV78h4pyjWq1OLQtn2ov"
-        
         st.info(f"Downloading model from Google Drive (File ID: {correct_file_id})...")
         
-        # Use gdown library
         try:
             import gdown
         except ImportError:
-            st.info("Installing gdown library for reliable Google Drive downloads...")
+            st.info("Installing gdown library...")
             subprocess.check_call([sys.executable, "-m", "pip", "install", "gdown"])
             import gdown
         
-        # Try multiple download approaches
         download_methods = [
             f"https://drive.google.com/uc?id={correct_file_id}",
             f"https://drive.google.com/file/d/{correct_file_id}/view",
@@ -207,7 +201,6 @@ def download_model_from_gdrive(gdrive_url, local_filename):
                 
                 if os.path.exists(local_filename) and os.path.getsize(local_filename) > 1024:
                     file_size = os.path.getsize(local_filename)
-                    
                     with open(local_filename, 'rb') as f:
                         header = f.read(10)
                         if header.startswith(b'\x80\x02') or header.startswith(b'\x80\x03') or header.startswith(b'PK'):
@@ -226,7 +219,6 @@ def download_model_from_gdrive(gdrive_url, local_filename):
                     os.remove(local_filename)
                 continue
         
-        # Fallback to manual download
         return manual_download_fallback(correct_file_id, local_filename)
             
     except Exception as e:
@@ -244,9 +236,7 @@ def manual_download_fallback(file_id, local_filename):
         ]
         
         session = requests.Session()
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         
         for i, url in enumerate(urls_to_try):
             try:
@@ -269,7 +259,6 @@ def manual_download_fallback(file_id, local_filename):
                                 if chunk:
                                     f.write(chunk)
                                     downloaded_size += len(chunk)
-                                    
                                     if total_size > 0:
                                         progress = downloaded_size / total_size
                                         progress_bar.progress(progress)
@@ -288,7 +277,6 @@ def manual_download_fallback(file_id, local_filename):
                 st.warning(f"Manual method {i+1} failed: {e}")
                 continue
         
-        # All methods failed - provide manual instructions
         st.error("All automatic download methods failed. Please download manually:")
         st.markdown(f"""
         1. **Open this link:** https://drive.google.com/file/d/{file_id}/view
@@ -305,7 +293,6 @@ def manual_download_fallback(file_id, local_filename):
         if uploaded_file is not None:
             with open(local_filename, 'wb') as f:
                 f.write(uploaded_file.read())
-            
             file_size = os.path.getsize(local_filename)
             st.success(f"Model uploaded successfully! Size: {file_size / (1024*1024):.1f} MB")
             return local_filename
@@ -315,6 +302,7 @@ def manual_download_fallback(file_id, local_filename):
     except Exception as e:
         st.error(f"Manual download fallback failed: {e}")
         return None
+
 
 # =============================================================================
 # Model Loading Function
@@ -327,7 +315,7 @@ def load_model(model_path):
         model = smp.UnetPlusPlus(
             encoder_name='timm-efficientnet-b7',
             encoder_weights='imagenet',
-            in_channels=12,  # 12 bands for Sentinel-2
+            in_channels=12,
             classes=1,
             decoder_attention_type='scse'
         ).to(device)
@@ -350,6 +338,7 @@ def load_model(model_path):
     except Exception as e:
         st.error(f"Error loading model: {str(e)}")
         return None, None
+
 
 # =============================================================================
 # Earth Engine Authentication
@@ -386,6 +375,7 @@ def initialize_earth_engine():
         except Exception as auth_error:
             return False, f"Authentication failed: {str(auth_error)}"
 
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -401,49 +391,24 @@ def get_utm_epsg(longitude, latitude):
     else:
         return f"EPSG:327{zone_number:02d}"
 
-def normalized(img):
-    """Normalize image data to range [0, 1]"""
-    min_val = np.nanmin(img)
-    max_val = np.nanmax(img)
-    
-    if max_val == min_val:
-        return np.zeros_like(img)
-    
-    img_norm = (img - min_val) / (max_val - min_val)
-    return img_norm
 
 # =============================================================================
-# RGB Image Generation Functions (NEW)
+# RGB Image Generation Functions
 # =============================================================================
 def generate_rgb_thumbnail(image_path, month_name, max_size=256):
     """
     Generate an RGB thumbnail from a Sentinel-2 multiband image.
     Uses B4 (Red), B3 (Green), B2 (Blue) for true color visualization.
-    
-    Args:
-        image_path: Path to the multiband GeoTIFF
-        month_name: Name of the month for labeling
-        max_size: Maximum dimension for the thumbnail
-    
-    Returns:
-        PIL.Image: RGB thumbnail or None if failed
     """
     try:
         with rasterio.open(image_path) as src:
-            # Read RGB bands (B4=index 3, B3=index 2, B2=index 1 in 0-indexed)
-            # In our SPECTRAL_BANDS list: B2=index 1, B3=index 2, B4=index 3
             red = src.read(4)    # B4 - Red
             green = src.read(3)  # B3 - Green
             blue = src.read(2)   # B2 - Blue
             
-            # Stack into RGB array
             rgb = np.stack([red, green, blue], axis=-1)
-            
-            # Handle NaN values
             rgb = np.nan_to_num(rgb, nan=0.0)
             
-            # Normalize each channel to 0-255 for display
-            # Use percentile stretching for better visualization
             def percentile_stretch(band, lower=2, upper=98):
                 """Apply percentile stretching to enhance contrast"""
                 p_low = np.percentile(band[band > 0], lower) if np.any(band > 0) else 0
@@ -459,10 +424,8 @@ def generate_rgb_thumbnail(image_path, month_name, max_size=256):
             for i in range(3):
                 rgb_uint8[:, :, i] = percentile_stretch(rgb[:, :, i])
             
-            # Create PIL image
             pil_img = Image.fromarray(rgb_uint8, mode='RGB')
             
-            # Resize if needed
             h, w = pil_img.size[1], pil_img.size[0]
             if h > max_size or w > max_size:
                 scale = max_size / max(h, w)
@@ -477,7 +440,7 @@ def generate_rgb_thumbnail(image_path, month_name, max_size=256):
 
 
 # =============================================================================
-# GEE Processing Functions
+# FIXED: GEE Processing Functions - NO 0.0001 SCALING
 # =============================================================================
 def create_gapfilled_timeseries(aoi, start_date, end_date, 
                                  cloudy_pixel_percentage=10,
@@ -486,18 +449,9 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     """
     Create gap-filled monthly Sentinel-2 composites.
     
-    Gap-filling strategy: CLOSEST TIME INTERVAL (M-1, M+1, M-2)
-    - Collect cloud-free images from 3 adjacent months
-    - Sort by time distance from middle of current month
-    - Use closest cloud-free pixel first
-    
-    Only returns images that are COMPLETELY cloud-free (0% masked pixels).
-    
-    Returns:
-        tuple: (final_collection, total_months)
+    FIXED: No longer multiplies by 0.0001 - keeps raw DN values to match working app.
     """
     
-    # Date calculations
     start_dt = datetime.datetime.strptime(start_date, '%Y-%m-%d')
     end_dt = datetime.datetime.strptime(end_date, '%Y-%m-%d')
     total_months = (end_dt.year - start_dt.year) * 12 + (end_dt.month - start_dt.month)
@@ -506,11 +460,9 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     end_date_ee = ee.Date(end_date)
     num_months = ee.Number(total_months)
     
-    # Extended date range for gap-filling (2 months before, 1 month after)
     extended_start = start_date_ee.advance(-2, 'month')
     extended_end = end_date_ee.advance(1, 'month')
     
-    # Load collections
     s2_sr = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
              .filterBounds(aoi)
              .filterDate(extended_start, extended_end)
@@ -521,14 +473,14 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
                 .filterBounds(aoi)
                 .filterDate(extended_start, extended_end))
     
-    # Join collections
     s2_joined = ee.ImageCollection(ee.Join.saveFirst('cloud_prob').apply(
         primary=s2_sr, 
         secondary=s2_cloud,
         condition=ee.Filter.equals(leftField='system:index', rightField='system:index')
     )).map(lambda img: img.addBands(ee.Image(img.get('cloud_prob'))))
     
-    # Cloud masking function
+    # FIXED: Cloud masking WITHOUT the 0.0001 scaling
+    # This matches the working app which uses raw DN values
     def mask_clouds(img):
         cloud_prob = img.select('probability')
         cdi = ee.Algorithms.Sentinel2.CDI(img)
@@ -536,12 +488,16 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
         kernel = ee.Kernel.circle(radius=20, units='meters')
         cloud_dilated = is_cloud.focal_max(kernel=kernel, iterations=2)
         masked = img.updateMask(cloud_dilated.Not())
-        scaled = masked.select(SPECTRAL_BANDS).multiply(0.0001).clip(aoi)
-        return scaled.copyProperties(img, ['system:time_start'])
+        
+        # FIXED: NO scaling - keep raw DN values (typically 0-10000 range)
+        # The working app does: median_image = collection.median().select(S2_BANDS)
+        # without any scaling, so we match that behavior
+        selected = masked.select(SPECTRAL_BANDS).clip(aoi)
+        
+        return selected.copyProperties(img, ['system:time_start'])
     
     cloud_free_collection = s2_joined.map(mask_clouds)
     
-    # Create monthly composites with frequency tracking
     origin = ee.Date(start_date)
     
     empty_image = (ee.Image.constant(ee.List.repeat(0, len(SPECTRAL_BANDS)))
@@ -558,7 +514,6 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
         monthly_images = cloud_free_collection.filterDate(month_start, month_end)
         image_count = monthly_images.size()
         
-        # Frequency map: count of valid observations per pixel
         frequency_map = ee.Image(ee.Algorithms.If(
             image_count.gt(0),
             monthly_images.map(lambda img: 
@@ -567,17 +522,14 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
             ee.Image.constant(0).toInt().clip(aoi)
         )).rename('frequency')
         
-        # Monthly composite (median)
         monthly_composite = ee.Image(ee.Algorithms.If(
             image_count.gt(0),
             monthly_images.median(),
             empty_image.clip(aoi)
         ))
         
-        # Validity mask
         validity_mask = frequency_map.gt(0).rename('validity_mask')
         
-        # Count masked pixels (where frequency == 0)
         masked_pixel_count = ee.Algorithms.If(
             image_count.gt(0),
             frequency_map.eq(0).reduceRegion(
@@ -601,14 +553,12 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
                 .set('has_data', image_count.gt(0))
                 .set('masked_pixel_count', masked_pixel_count))
     
-    # Create all monthly composites
     monthly_composites = ee.ImageCollection(
         ee.List.sequence(0, num_months.subtract(1)).map(create_monthly_composite)
     )
     monthly_list = monthly_composites.toList(num_months)
     month_indices = ee.List.sequence(0, num_months.subtract(1))
     
-    # Identify months with data
     months_with_data = month_indices.map(lambda i: 
         ee.Algorithms.If(
             ee.Image(monthly_list.get(i)).get('has_data'),
@@ -617,12 +567,8 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
         )
     ).removeAll([None])
     
-    # =========================================================================
-    # GAP-FILLING: CLOSEST TIME INTERVAL (M-1, M+1, M-2)
-    # =========================================================================
-    
+    # Gap-filling function
     def gap_fill_month_closest(month_index):
-        """Gap-fill using closest time interval strategy."""
         month_index = ee.Number(month_index)
         
         current_img = ee.Image(monthly_list.get(month_index))
@@ -692,7 +638,6 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
                 .copyProperties(current_img, current_img.propertyNames()))
     
     def prepare_complete_month(month_index):
-        """Prepare a month that already has complete data (no gaps)."""
         month_index = ee.Number(month_index)
         
         current_img = ee.Image(monthly_list.get(month_index))
@@ -727,12 +672,7 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     
     processed_months_list = month_indices.map(process_month)
     
-    # =========================================================================
-    # FILTER TO ONLY COMPLETE MONTHS
-    # =========================================================================
-    
     def check_if_complete(i):
-        """Check if a processed month has 0 still-masked pixels."""
         img = ee.Image(ee.List(processed_months_list).get(i))
         
         return ee.Algorithms.If(
@@ -760,6 +700,7 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     
     def get_complete_image(i):
         img = ee.Image(ee.List(processed_months_list).get(i))
+        # FIXED: Use toDouble() to preserve raw DN values properly
         return (img.select(SPECTRAL_BANDS).toDouble()
                 .set('system:index', img.get('month_name'))
                 .set('month_name', img.get('month_name'))
@@ -771,18 +712,26 @@ def create_gapfilled_timeseries(aoi, start_date, end_date,
     
     return final_collection, total_months
 
+
 # =============================================================================
-# Download Monthly Image from GEE (with improved retry and validation)
+# Download Functions with .tmp file approach
 # =============================================================================
 def download_band_with_retry(image, band, aoi, output_path, scale=10):
-    """
-    Download a single band with retry mechanism and exponential backoff.
-    Now includes proper validation after download.
-    
-    Returns:
-        bool: True if successful, False otherwise
-    """
+    """Download a single band with retry mechanism using .tmp file approach."""
     region = aoi.bounds().getInfo()['coordinates']
+    
+    # If .tmp file exists from previous crash, delete it
+    temp_path = output_path + '.tmp'
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+    
+    # If final file exists and is valid, skip
+    if os.path.exists(output_path):
+        is_valid, msg = validate_band_file(output_path, band)
+        if is_valid:
+            return True
+        else:
+            os.remove(output_path)
     
     for attempt in range(MAX_RETRIES):
         try:
@@ -793,19 +742,14 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
                 'bands': [band]
             })
             
-            response = requests.get(
-                url, 
-                stream=True, 
-                timeout=DOWNLOAD_TIMEOUT
-            )
+            response = requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT)
             
             if response.status_code == 200:
                 content_type = response.headers.get('content-type', '')
                 if 'text/html' in content_type:
                     raise Exception("Received HTML instead of GeoTIFF - possible rate limit")
                 
-                # Download to a temporary file first
-                temp_path = output_path + '.tmp'
+                # Download to temp file first
                 with open(temp_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                         if chunk:
@@ -815,11 +759,10 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
                 is_valid, msg = validate_band_file(temp_path, band)
                 
                 if is_valid:
-                    # Move temp file to final location
+                    # Move temp file to final location (atomic operation)
                     os.replace(temp_path, output_path)
                     return True
                 else:
-                    # Invalid file - remove and retry
                     if os.path.exists(temp_path):
                         os.remove(temp_path)
                     raise Exception(f"Downloaded file invalid: {msg}")
@@ -834,14 +777,13 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
             st.warning(f"⚠️ Error downloading {band}: {str(e)} (attempt {attempt + 1}/{MAX_RETRIES})")
         
         # Clean up any partial files
-        for f in [output_path, output_path + '.tmp']:
+        for f in [output_path, temp_path]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
                 except:
                     pass
         
-        # Exponential backoff before retry
         if attempt < MAX_RETRIES - 1:
             wait_time = RETRY_DELAY_BASE ** (attempt + 1)
             st.info(f"⏳ Waiting {wait_time}s before retry...")
@@ -851,21 +793,7 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
 
 
 def download_monthly_image(image, aoi, month_name, temp_dir, scale=10, status_placeholder=None):
-    """
-    Download a single monthly Sentinel-2 composite from GEE with retry mechanism.
-    Now includes proper file validation for cached files.
-    
-    Args:
-        image: ee.Image to download
-        aoi: ee.Geometry area of interest
-        month_name: str name of the month (e.g., "2023-06")
-        temp_dir: str path to temporary directory
-        scale: int resolution in meters (10 or 20)
-        status_placeholder: Streamlit placeholder for status updates
-    
-    Returns:
-        str: Path to downloaded GeoTIFF or None if failed
-    """
+    """Download a single monthly Sentinel-2 composite from GEE."""
     try:
         output_file = os.path.join(temp_dir, f"sentinel2_{month_name}.tif")
         
@@ -874,12 +802,11 @@ def download_monthly_image(image, aoi, month_name, temp_dir, scale=10, status_pl
             is_valid, msg = validate_geotiff_file(output_file, expected_bands=len(SPECTRAL_BANDS))
             if is_valid:
                 if status_placeholder:
-                    status_placeholder.info(f"✅ {month_name} already downloaded and validated, using cached file")
+                    status_placeholder.info(f"✅ {month_name} already downloaded and validated")
                 return output_file
             else:
-                # Cached file is corrupted - remove it
                 if status_placeholder:
-                    status_placeholder.warning(f"⚠️ {month_name} cached file is corrupted ({msg}), re-downloading...")
+                    status_placeholder.warning(f"⚠️ {month_name} cached file corrupted ({msg}), re-downloading...")
                 os.remove(output_file)
         
         bands_dir = os.path.join(temp_dir, f"bands_{month_name}")
@@ -894,19 +821,6 @@ def download_monthly_image(image, aoi, month_name, temp_dir, scale=10, status_pl
             if status_placeholder:
                 status_placeholder.text(f"📥 {month_name}: Downloading {band} ({i+1}/{len(SPECTRAL_BANDS)})...")
             
-            # Check if band already downloaded AND VALID
-            if os.path.exists(band_file):
-                is_valid, msg = validate_band_file(band_file, band)
-                if is_valid:
-                    band_files.append(band_file)
-                    continue
-                else:
-                    # Cached band is corrupted - remove it
-                    if status_placeholder:
-                        status_placeholder.warning(f"⚠️ Cached {band} is corrupted ({msg}), re-downloading...")
-                    os.remove(band_file)
-            
-            # Download with retry
             success = download_band_with_retry(image, band, aoi, band_file, scale)
             
             if success:
@@ -914,12 +828,10 @@ def download_monthly_image(image, aoi, month_name, temp_dir, scale=10, status_pl
             else:
                 failed_bands.append(band)
         
-        # Check if all bands were downloaded
         if failed_bands:
             st.error(f"❌ {month_name}: Failed to download bands: {', '.join(failed_bands)}")
             return None
         
-        # Create multiband GeoTIFF
         if len(band_files) == len(SPECTRAL_BANDS):
             if status_placeholder:
                 status_placeholder.text(f"📦 {month_name}: Creating multiband GeoTIFF...")
@@ -934,7 +846,6 @@ def download_monthly_image(image, aoi, month_name, temp_dir, scale=10, status_pl
                     with rasterio.open(band_file) as src:
                         dst.write(src.read(1), i+1)
             
-            # Validate the final multiband file
             is_valid, msg = validate_geotiff_file(output_file, expected_bands=len(SPECTRAL_BANDS))
             if not is_valid:
                 st.error(f"❌ {month_name}: Final multiband file validation failed: {msg}")
@@ -950,16 +861,12 @@ def download_monthly_image(image, aoi, month_name, temp_dir, scale=10, status_pl
         st.error(f"❌ Error downloading {month_name}: {str(e)}")
         return None
 
+
 # =============================================================================
-# Classification Functions
+# FIXED: Classification Functions - Normalization matches working app
 # =============================================================================
 def verify_image_complete(image_path, month_name):
-    """
-    Verify that a downloaded image has NO NaN or masked pixels.
-    
-    Returns:
-        tuple: (is_complete: bool, message: str)
-    """
+    """Verify that a downloaded image has NO NaN or masked pixels."""
     try:
         with rasterio.open(image_path) as src:
             nodata = src.nodata
@@ -993,8 +900,9 @@ def classify_monthly_image(image_path, model, device, month_name):
     """
     Apply the building detection model to a monthly Sentinel-2 image.
     
-    Returns:
-        numpy.ndarray: Binary classification mask or None if failed
+    FIXED: Normalization now matches working app exactly:
+    - Normalize each PATCH globally (all bands together)
+    - NOT per-band normalization
     """
     try:
         is_complete, verify_msg = verify_image_complete(image_path, month_name)
@@ -1003,28 +911,26 @@ def classify_monthly_image(image_path, model, device, month_name):
             return None
         
         with rasterio.open(image_path) as src:
-            img_data = src.read()
+            img_data = src.read()  # Shape: (bands, height, width)
             meta = src.meta.copy()
         
         if img_data.shape[1] < PATCH_SIZE or img_data.shape[2] < PATCH_SIZE:
             st.warning(f"{month_name}: Image too small for patching ({img_data.shape[1]}x{img_data.shape[2]})")
             return None
         
-        img_normalized = np.zeros_like(img_data, dtype=np.float32)
-        for i in range(img_data.shape[0]):
-            img_normalized[i] = normalized(img_data[i])
-        
-        img_for_patching = np.moveaxis(img_normalized, 0, -1)
+        # Convert to H x W x C format for patchify (NO normalization yet!)
+        img_for_patching = np.moveaxis(img_data, 0, -1)
         
         h, w, c = img_for_patching.shape
         new_h = int(np.ceil(h / PATCH_SIZE) * PATCH_SIZE)
         new_w = int(np.ceil(w / PATCH_SIZE) * PATCH_SIZE)
         
         if h != new_h or w != new_w:
-            padded_img = np.zeros((new_h, new_w, c), dtype=np.float32)
+            padded_img = np.zeros((new_h, new_w, c), dtype=img_for_patching.dtype)
             padded_img[:h, :w, :] = img_for_patching
             img_for_patching = padded_img
         
+        # Create patches
         patches = patchify(img_for_patching, (PATCH_SIZE, PATCH_SIZE, c), step=PATCH_SIZE)
         
         n_patches_h, n_patches_w = patches.shape[0], patches.shape[1]
@@ -1033,20 +939,29 @@ def classify_monthly_image(image_path, model, device, month_name):
         
         for i in range(n_patches_h):
             for j in range(n_patches_w):
-                patch = patches[i, j, 0]
+                patch = patches[i, j, 0]  # Shape: (H, W, C)
                 
-                patch_tensor = torch.tensor(np.moveaxis(patch, -1, 0), dtype=torch.float32)
-                patch_tensor = patch_tensor.unsqueeze(0)
+                # FIXED: Normalize the ENTIRE PATCH globally (all bands together)
+                # This matches the working app exactly:
+                # patch_normalized = normalized(patch)
+                patch_normalized = normalized(patch)
                 
+                # Convert to torch tensor (C, H, W)
+                patch_tensor = torch.tensor(np.moveaxis(patch_normalized, -1, 0), dtype=torch.float32)
+                patch_tensor = patch_tensor.unsqueeze(0)  # Add batch dimension
+                
+                # Run inference
                 with torch.inference_mode():
                     prediction = model(patch_tensor)
                     prediction = torch.sigmoid(prediction).cpu()
                 
+                # Convert to binary mask
                 pred_np = prediction.squeeze().numpy()
                 binary_mask = (pred_np > 0.5).astype(np.uint8) * 255
                 
                 classified_patches[i, j] = binary_mask
         
+        # Reconstruct the full classification image
         reconstructed = unpatchify(classified_patches, (new_h, new_w))
         reconstructed = reconstructed[:h, :w]
         
@@ -1058,21 +973,15 @@ def classify_monthly_image(image_path, model, device, month_name):
         st.warning(traceback.format_exc())
         return None
 
+
 # =============================================================================
-# Generate Classification and RGB Thumbnails (UPDATED)
+# Generate Thumbnails
 # =============================================================================
 def generate_thumbnails(image_path, classification_mask, month_name, max_size=256):
-    """
-    Generate both RGB and classification thumbnails.
-    
-    Returns:
-        dict: Thumbnail data including both images and metadata
-    """
+    """Generate both RGB and classification thumbnails."""
     try:
-        # Generate RGB thumbnail
         rgb_thumbnail = generate_rgb_thumbnail(image_path, month_name, max_size)
         
-        # Generate classification thumbnail
         h, w = classification_mask.shape
         
         if h > max_size or w > max_size:
@@ -1097,43 +1006,11 @@ def generate_thumbnails(image_path, classification_mask, month_name, max_size=25
         return None
 
 
-def generate_classification_thumbnail(classification_mask, month_name):
-    """
-    Generate a thumbnail image from a classification mask (legacy function).
-    Kept for backward compatibility.
-    """
-    try:
-        max_size = 256
-        h, w = classification_mask.shape
-        
-        if h > max_size or w > max_size:
-            scale = max_size / max(h, w)
-            new_h, new_w = int(h * scale), int(w * scale)
-            pil_img = Image.fromarray(classification_mask.astype(np.uint8))
-            pil_img = pil_img.resize((new_w, new_h), Image.NEAREST)
-        else:
-            pil_img = Image.fromarray(classification_mask.astype(np.uint8))
-        
-        return {
-            'image': pil_img,
-            'month_name': month_name,
-            'original_size': (h, w),
-            'building_pixels': np.sum(classification_mask > 0),
-            'total_pixels': h * w
-        }
-        
-    except Exception as e:
-        st.warning(f"Error creating thumbnail for {month_name}: {str(e)}")
-        return None
-
 # =============================================================================
-# Process Time Series - Main Function (UPDATED with RGB support)
+# Process Time Series
 # =============================================================================
 def process_timeseries_classification(final_collection, aoi, model, device, scale=10, resume=False):
-    """
-    Process the entire time series: download, classify, and create thumbnails.
-    Now generates both RGB and classification thumbnails.
-    """
+    """Process the entire time series: download, classify, and create thumbnails."""
     
     try:
         st.info("📥 Fetching collection metadata...")
@@ -1212,7 +1089,6 @@ def process_timeseries_classification(final_collection, aoi, model, device, scal
                     progress_bar.progress((idx + 1) / num_images)
                     continue
                 
-                # Generate both RGB and classification thumbnails
                 thumbnail_data = generate_thumbnails(image_path, classification_mask, month_name)
                 
                 if thumbnail_data:
@@ -1264,20 +1140,17 @@ def process_timeseries_classification(final_collection, aoi, model, device, scal
         st.error(traceback.format_exc())
         return []
 
+
 # =============================================================================
-# Display Classification Thumbnails (UPDATED - side by side RGB + Classification)
+# Display Thumbnails
 # =============================================================================
 def display_classification_thumbnails(thumbnails):
-    """
-    Display RGB and classification thumbnails side by side.
-    Each month shows: RGB image | Classification mask
-    """
+    """Display RGB and classification thumbnails side by side."""
     
     if not thumbnails:
         st.info("No classifications to display. Click 'Generate Classifications' to process.")
         return
     
-    # Display format options
     display_mode = st.radio(
         "Display Mode:",
         ["Side by Side (RGB + Classification)", "Classification Only", "RGB Only"],
@@ -1287,8 +1160,7 @@ def display_classification_thumbnails(thumbnails):
     st.divider()
     
     if display_mode == "Side by Side (RGB + Classification)":
-        # 2 columns per month (RGB + Classification)
-        num_cols = 4  # 2 pairs
+        num_cols = 4
         
         for i in range(0, len(thumbnails), 2):
             cols = st.columns(num_cols)
@@ -1299,7 +1171,6 @@ def display_classification_thumbnails(thumbnails):
                     thumb = thumbnails[idx]
                     building_pct = (thumb['building_pixels'] / thumb['total_pixels']) * 100
                     
-                    # RGB image
                     with cols[j * 2]:
                         if thumb.get('rgb_image') is not None:
                             st.image(
@@ -1310,7 +1181,6 @@ def display_classification_thumbnails(thumbnails):
                         else:
                             st.warning(f"No RGB for {thumb['month_name']}")
                     
-                    # Classification image
                     with cols[j * 2 + 1]:
                         class_img = thumb.get('classification_image') or thumb.get('image')
                         if class_img is not None:
@@ -1364,6 +1234,7 @@ def display_classification_thumbnails(thumbnails):
                         else:
                             st.warning(f"No RGB for {thumb['month_name']}")
 
+
 # =============================================================================
 # Main Application
 # =============================================================================
@@ -1373,21 +1244,14 @@ def main():
     View building classification results from cloud-free Sentinel-2 monthly composites 
     using a UNet++ deep learning model.
     
-    **Workflow:**
-    1. Select region of interest and time period
-    2. Generate cloud-free monthly composites (GEE)
-    3. Apply UNet++ building detection model
-    4. Display **RGB + Classification masks** for each month
-    
-    **Version 03 Updates:**
-    - ✨ RGB thumbnails displayed alongside classifications
-    - 🔒 Improved cache validation (detects corrupted downloads)
-    - 🔄 Better retry mechanism for failed downloads
+    **Version 04 - FIXED preprocessing to match working app:**
+    - ✅ Raw DN values (no 0.0001 scaling in GEE)
+    - ✅ Per-patch global normalization (all bands together)
+    - ✅ Cache validation with .tmp file approach
+    - ✅ RGB thumbnails alongside classifications
     """)
     
-    # =========================================================================
     # Initialize Earth Engine
-    # =========================================================================
     ee_initialized, ee_message = initialize_earth_engine()
     
     if not ee_initialized:
@@ -1405,9 +1269,7 @@ def main():
     else:
         st.sidebar.success(ee_message)
     
-    # =========================================================================
     # Model Loading
-    # =========================================================================
     st.sidebar.header("🧠 Model Status")
     
     model_path = "best_model_version_Unet++_v02_e7.pt"
@@ -1434,55 +1296,36 @@ def main():
     else:
         st.sidebar.success("✅ Model already loaded")
     
-    # =========================================================================
     # Sidebar - Cloud Parameters
-    # =========================================================================
     st.sidebar.header("⚙️ Cloud Filtering Parameters")
     
     cloudy_pixel_percentage = st.sidebar.slider(
         "Max Cloudy Pixel Percentage",
-        min_value=0,
-        max_value=100,
-        value=10,
-        step=5,
-        help="Filter out images with cloud cover above this percentage"
+        min_value=0, max_value=100, value=10, step=5
     )
     
     cloud_probability_threshold = st.sidebar.slider(
         "Cloud Probability Threshold",
-        min_value=0,
-        max_value=100,
-        value=65,
-        step=5,
-        help="Pixels with cloud probability above this threshold are masked"
+        min_value=0, max_value=100, value=65, step=5
     )
     
     cdi_threshold = st.sidebar.slider(
         "CDI Threshold",
-        min_value=-1.0,
-        max_value=0.0,
-        value=-0.5,
-        step=0.1,
-        help="Cloud Displacement Index threshold for cloud detection"
+        min_value=-1.0, max_value=0.0, value=-0.5, step=0.1
     )
     
-    # =========================================================================
     # Sidebar - Download Settings
-    # =========================================================================
     st.sidebar.header("📥 Download Settings")
-    
     download_resolution = 10
     st.sidebar.info("📏 Resolution: 10m (full resolution)")
     
-    # =========================================================================
     # Sidebar - Cache Management
-    # =========================================================================
     st.sidebar.header("🗂️ Cache Management")
     
     if st.session_state.processed_months:
         st.sidebar.success(f"✅ {len(st.session_state.processed_months)} months cached")
         
-        if st.sidebar.button("🗑️ Clear Cache", help="Clear all cached downloads and results"):
+        if st.sidebar.button("🗑️ Clear Cache"):
             st.session_state.processed_months = {}
             st.session_state.failed_months = []
             st.session_state.classification_thumbnails = []
@@ -1497,9 +1340,7 @@ def main():
     if st.session_state.failed_months:
         st.sidebar.warning(f"❌ {len(st.session_state.failed_months)} failed months")
     
-    # =========================================================================
     # Region Selection
-    # =========================================================================
     st.header("1️⃣ Select Region of Interest")
     st.info("Draw a rectangle or polygon on the map to define your area of interest.")
     
@@ -1558,9 +1399,7 @@ def main():
         else:
             st.warning("Please draw a polygon on the map first")
     
-    # =========================================================================
     # Saved Regions
-    # =========================================================================
     if st.session_state.drawn_polygons:
         st.subheader("📍 Saved Regions")
         
@@ -1589,9 +1428,7 @@ def main():
         
         st.divider()
     
-    # =========================================================================
     # Date Selection
-    # =========================================================================
     st.header("2️⃣ Select Time Period")
     
     col1, col2 = st.columns(2)
@@ -1601,8 +1438,7 @@ def main():
             "Start Date",
             value=date(2023, 6, 1),
             min_value=date(2017, 1, 1),
-            max_value=date.today(),
-            help="Select the start date for the time series"
+            max_value=date.today()
         )
     
     with col2:
@@ -1610,8 +1446,7 @@ def main():
             "End Date",
             value=date(2024, 2, 1),
             min_value=date(2017, 1, 1),
-            max_value=date.today(),
-            help="Select the end date for the time series"
+            max_value=date.today()
         )
     
     if start_date >= end_date:
@@ -1622,11 +1457,9 @@ def main():
     st.info(f"📅 Time period: {start_date.strftime('%Y-%m')} to {end_date.strftime('%Y-%m')} ({num_months} months)")
     
     if num_months > 12:
-        st.warning(f"⚡ Processing {num_months} months with model inference - this may take several minutes.")
+        st.warning(f"⚡ Processing {num_months} months - this may take several minutes.")
     
-    # =========================================================================
     # Generate Classifications
-    # =========================================================================
     st.header("3️⃣ Generate Building Classifications")
     
     selected_polygon = None
@@ -1650,18 +1483,13 @@ def main():
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        start_new = st.button("🚀 Start New Processing", type="primary", 
-                              help="Clear cache and start fresh")
+        start_new = st.button("🚀 Start New Processing", type="primary")
     
     with col2:
-        resume_processing = st.button("🔄 Resume Processing", 
-                                      disabled=not st.session_state.processed_months,
-                                      help="Continue from where it stopped")
+        resume_processing = st.button("🔄 Resume Processing", disabled=not st.session_state.processed_months)
     
     with col3:
-        retry_failed = st.button("🔁 Retry Failed", 
-                                 disabled=not st.session_state.failed_months,
-                                 help="Retry only the failed months")
+        retry_failed = st.button("🔁 Retry Failed", disabled=not st.session_state.failed_months)
     
     should_process = False
     resume_mode = False
@@ -1717,17 +1545,14 @@ def main():
                 st.info(f"""
                 📊 **Image Quality Summary:**
                 - Total months requested: {total_months}
-                - Complete images (no masked pixels): {complete_count}
-                - Excluded images (still have masked pixels after gap-filling): {excluded_count}
+                - Complete images: {complete_count}
+                - Excluded images: {excluded_count}
                 """)
                 
                 if complete_count == 0:
-                    st.error("❌ No complete images available for the selected time period and region!")
+                    st.error("❌ No complete images available!")
                     st.warning("Try: Increasing cloud cover %, selecting a different time period, or choosing a smaller region.")
                     st.stop()
-                
-                if excluded_count > 0:
-                    st.warning(f"⚠️ {excluded_count} months were excluded because they still have masked pixels after gap-filling.")
                 
                 st.session_state.data_summary = {
                     'total_months': total_months,
@@ -1761,9 +1586,7 @@ def main():
         else:
             st.warning("No classifications were generated.")
     
-    # =========================================================================
     # Display Results
-    # =========================================================================
     if st.session_state.processing_complete and st.session_state.classification_thumbnails:
         st.divider()
         
@@ -1775,19 +1598,16 @@ def main():
             
             st.success(f"""
             **📊 Processing Summary:**
-            - Total months in time period: {total}
-            - Complete images available (no masked pixels): {complete}
-            - Excluded (still had masked pixels): {excluded}
+            - Total months: {total}
+            - Complete images: {complete}
+            - Excluded: {excluded}
             - Successfully classified: {processed}
             """)
         
         st.subheader("📅 Monthly Building Classifications")
-        st.caption("White = Buildings detected | Black = No buildings | Percentage shows building coverage")
-        st.caption("⚠️ Only months with 100% valid pixels (no clouds/masks) are shown")
+        st.caption("White = Buildings | Black = No buildings | Percentage shows building coverage")
         display_classification_thumbnails(st.session_state.classification_thumbnails)
 
-# =============================================================================
-# Run Application
-# =============================================================================
+
 if __name__ == "__main__":
     main()
