@@ -1,15 +1,15 @@
 """
 Sentinel-2 Time Series Building Classification
-VERSION 05 - NODATA HANDLING + FULL CACHE SUPPORT
+VERSION 06 - STRICT NODATA HANDLING + MONTH DELETION
 
-Features:
-- Two-pass approach: Download all → Find valid patches → Classify
-- Patches with ANY nodata in ANY month are excluded from ALL months
-- Full cache support with .tmp file approach (from v04)
-- Resume processing if interrupted
-- Failed months tracking and retry
-- Raw DN values (no 0.0001 scaling)
-- Per-patch global normalization
+Key Features:
+- Two-pass approach: Download all → Find valid patches → Filter months → Classify
+- STRICT nodata checking: Any NaN or zero = invalid patch
+- Months with fewer valid patches than maximum are DELETED
+- All remaining months guaranteed to have identical valid patch coverage
+- Reports: X out of Y months have valid cloud-free data
+- Fixed 10% cloud cover threshold
+- Full cache support with resume capability
 """
 
 import os
@@ -47,7 +47,7 @@ import streamlit as st
 
 st.set_page_config(
     layout="wide", 
-    page_title="Building Classification Time Series v05",
+    page_title="Building Classification Time Series v06",
     page_icon="🏗️"
 )
 
@@ -56,23 +56,31 @@ from folium import plugins
 from streamlit_folium import st_folium
 import segmentation_models_pytorch as smp
 
+# =============================================================================
+# CONSTANTS
+# =============================================================================
 SPECTRAL_BANDS = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12']
 PATCH_SIZE = 224
 
 # RGB bands for visualization (True Color: B4=Red, B3=Green, B2=Blue)
 RGB_BAND_INDICES = {'red': 3, 'green': 2, 'blue': 1}
 
-# Download settings - KEPT FROM V04
+# Download settings
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2
 DOWNLOAD_TIMEOUT = 120
 CHUNK_SIZE = 8192
 
-# Minimum expected file sizes for validation - KEPT FROM V04
+# Minimum expected file sizes for validation
 MIN_BAND_FILE_SIZE = 10000
 MIN_MULTIBAND_FILE_SIZE = 100000
 
-# Session state initialization - EXPANDED
+# FIXED cloud cover threshold (no slider)
+CLOUDY_PIXEL_PERCENTAGE = 10
+
+# =============================================================================
+# Session State Initialization
+# =============================================================================
 if 'drawn_polygons' not in st.session_state:
     st.session_state.drawn_polygons = []
 if 'last_drawn_polygon' not in st.session_state:
@@ -101,7 +109,7 @@ if 'processing_in_progress' not in st.session_state:
     st.session_state.processing_in_progress = False
 if 'last_processed_index' not in st.session_state:
     st.session_state.last_processed_index = 0
-# NEW for v05: Valid patch mask and downloaded images tracking
+# Valid patch mask and downloaded images tracking
 if 'valid_patches_mask' not in st.session_state:
     st.session_state.valid_patches_mask = None
 if 'downloaded_images' not in st.session_state:
@@ -110,6 +118,13 @@ if 'download_phase_complete' not in st.session_state:
     st.session_state.download_phase_complete = False
 if 'validity_analysis_complete' not in st.session_state:
     st.session_state.validity_analysis_complete = False
+# NEW: Track months that passed validation
+if 'valid_months' not in st.session_state:
+    st.session_state.valid_months = []
+if 'deleted_months' not in st.session_state:
+    st.session_state.deleted_months = []
+if 'total_requested_months' not in st.session_state:
+    st.session_state.total_requested_months = 0
 
 
 # =============================================================================
@@ -131,7 +146,7 @@ def normalized(img):
 
 
 # =============================================================================
-# File Validation Functions - KEPT FROM V04
+# File Validation Functions
 # =============================================================================
 def validate_geotiff_file(file_path, expected_bands=1):
     """Validate that a GeoTIFF file is complete and readable."""
@@ -169,7 +184,7 @@ def validate_band_file(band_file_path, band_name):
 
 
 # =============================================================================
-# Model Download Functions - KEPT FROM V04
+# Model Download Functions
 # =============================================================================
 @st.cache_data
 def download_model_from_gdrive(gdrive_url, local_filename):
@@ -302,7 +317,7 @@ def manual_download_fallback(file_id, local_filename):
 
 
 # =============================================================================
-# Model Loading Function - KEPT FROM V04
+# Model Loading Function
 # =============================================================================
 @st.cache_resource
 def load_model(model_path):
@@ -338,7 +353,7 @@ def load_model(model_path):
 
 
 # =============================================================================
-# Earth Engine Authentication - KEPT FROM V04
+# Earth Engine Authentication
 # =============================================================================
 @st.cache_resource
 def initialize_earth_engine():
@@ -390,7 +405,7 @@ def get_utm_epsg(longitude, latitude):
 
 
 # =============================================================================
-# RGB Image Generation Functions - KEPT FROM V04
+# RGB Image Generation Functions
 # =============================================================================
 def generate_rgb_thumbnail(image_path, month_name, max_size=256):
     """
@@ -440,9 +455,9 @@ def generate_rgb_thumbnail(image_path, month_name, max_size=256):
 
 
 # =============================================================================
-# GEE Functions - Simple median composite (matching working app)
+# GEE Functions - Simple median composite
 # =============================================================================
-def create_monthly_composites_list(aoi, start_date, end_date, cloudy_pixel_percentage=10):
+def create_monthly_composites_list(aoi, start_date, end_date):
     """
     Create a list of month info for downloading.
     Uses simple median composites - matching working app approach.
@@ -478,7 +493,7 @@ def create_monthly_composites_list(aoi, start_date, end_date, cloudy_pixel_perce
 
 
 # =============================================================================
-# Download Functions with .tmp file approach - KEPT FROM V04
+# Download Functions with .tmp file approach
 # =============================================================================
 def download_band_with_retry(image, band, aoi, output_path, scale=10):
     """Download a single band with retry mechanism using .tmp file approach."""
@@ -556,11 +571,11 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
     return False
 
 
-def download_monthly_image(aoi, month_info, temp_dir, cloudy_pixel_percentage=10, scale=10, status_placeholder=None):
+def download_monthly_image(aoi, month_info, temp_dir, scale=10, status_placeholder=None):
     """
     Download a single monthly Sentinel-2 composite from GEE.
     Uses simple median composite - matching working app.
-    Includes cache checking and .tmp file approach.
+    Uses FIXED cloud cover threshold (10%).
     """
     try:
         month_name = month_info['month_name']
@@ -584,24 +599,24 @@ def download_monthly_image(aoi, month_info, temp_dir, cloudy_pixel_percentage=10
         if status_placeholder:
             status_placeholder.text(f"📥 {month_name}: Searching for images...")
         
-        # Simple collection filter - matches working app
+        # Simple collection filter with FIXED cloud cover threshold
         collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                      .filterBounds(aoi)
                      .filterDate(start_date, end_date)
-                     .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloudy_pixel_percentage))
+                     .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', CLOUDY_PIXEL_PERCENTAGE))
                      .select(SPECTRAL_BANDS))
         
         count = collection.size().getInfo()
         
         if count == 0:
-            # Try higher cloud cover
+            # Try higher cloud cover (up to 30%)
             if status_placeholder:
-                status_placeholder.text(f"📥 {month_name}: No images found, trying higher cloud cover...")
+                status_placeholder.text(f"📥 {month_name}: No images at {CLOUDY_PIXEL_PERCENTAGE}% cloud, trying 30%...")
             
             collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                          .filterBounds(aoi)
                          .filterDate(start_date, end_date)
-                         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', min(cloudy_pixel_percentage * 3, 50)))
+                         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
                          .select(SPECTRAL_BANDS))
             count = collection.size().getInfo()
             
@@ -671,46 +686,41 @@ def download_monthly_image(aoi, month_info, temp_dir, cloudy_pixel_percentage=10
 
 
 # =============================================================================
-# NODATA HANDLING - NEW FOR V05
+# STRICT NODATA HANDLING - No threshold, any zero/NaN = invalid
 # =============================================================================
-def check_patch_validity(patch, nodata_threshold_percent=5):
+def check_patch_validity_strict(patch):
     """
-    Check if a patch has any nodata (NaN, 0, or invalid values).
-    Returns True if patch is valid (minimal nodata), False otherwise.
+    STRICT check if a patch has ANY nodata (NaN or zero values).
+    Returns True if patch is COMPLETELY valid (no NaN, no zeros), False otherwise.
     
-    Args:
-        patch: numpy array of shape (H, W, C) or (H, W)
-        nodata_threshold_percent: Maximum percentage of zeros allowed
+    This is critical for time series analysis - we need ALL pixels valid in ALL months.
     """
-    # Check for NaN
+    # Check for any NaN values
     if np.any(np.isnan(patch)):
         return False
     
-    # Check for all-zero patch (common nodata indicator in Sentinel-2)
+    # Check for all-zero patch (definite nodata)
     if np.all(patch == 0):
         return False
     
-    # Check percentage of zeros
-    total_elements = patch.size
-    zero_count = np.sum(patch == 0)
-    zero_percent = (zero_count / total_elements) * 100
-    
-    if zero_percent > nodata_threshold_percent:
-        return False
-    
-    # Check if any band is all zeros (for 3D arrays)
+    # Check if ANY band has all zeros (indicates nodata in that band)
     if patch.ndim == 3:
         for band_idx in range(patch.shape[-1]):
             if np.all(patch[:, :, band_idx] == 0):
                 return False
     
+    # Check for ANY zero values (strict mode - even single zeros indicate potential nodata)
+    # This is important because Sentinel-2 valid reflectance values are typically > 0
+    if np.any(patch == 0):
+        return False
+    
     return True
 
 
-def get_patch_validity_mask(image_path, patch_size=224, nodata_threshold_percent=5):
+def get_patch_validity_mask_strict(image_path, patch_size=224):
     """
-    Create a mask showing which patches are valid (no nodata) for a single image.
-    Returns: 2D boolean array where True = valid patch
+    Create a mask showing which patches are STRICTLY valid (no nodata at all).
+    Returns: 2D boolean array where True = completely valid patch
     """
     try:
         with rasterio.open(image_path) as src:
@@ -723,7 +733,7 @@ def get_patch_validity_mask(image_path, patch_size=224, nodata_threshold_percent
         new_h = int(np.ceil(h / patch_size) * patch_size)
         new_w = int(np.ceil(w / patch_size) * patch_size)
         
-        # Pad if needed
+        # Pad if needed (padding with zeros will make edge patches invalid, which is correct)
         if h != new_h or w != new_w:
             padded_img = np.zeros((new_h, new_w, c), dtype=img_for_patching.dtype)
             padded_img[:h, :w, :] = img_for_patching
@@ -734,106 +744,126 @@ def get_patch_validity_mask(image_path, patch_size=224, nodata_threshold_percent
         
         n_patches_h, n_patches_w = patches.shape[0], patches.shape[1]
         
-        # Check each patch
+        # Check each patch with STRICT validation
         validity_mask = np.zeros((n_patches_h, n_patches_w), dtype=bool)
-        nodata_info = []
         
         for i in range(n_patches_h):
             for j in range(n_patches_w):
                 patch = patches[i, j, 0]
-                is_valid = check_patch_validity(patch, nodata_threshold_percent)
-                validity_mask[i, j] = is_valid
-                
-                if not is_valid:
-                    # Calculate nodata percentage for reporting
-                    zero_percent = (np.sum(patch == 0) / patch.size) * 100
-                    nodata_info.append((i, j, zero_percent))
+                validity_mask[i, j] = check_patch_validity_strict(patch)
         
-        return validity_mask, (h, w), (n_patches_h, n_patches_w), nodata_info
+        return validity_mask, (h, w), (n_patches_h, n_patches_w)
         
     except Exception as e:
         st.error(f"Error checking validity: {str(e)}")
-        return None, None, None, None
+        return None, None, None
 
 
-def find_common_valid_patches(downloaded_images, nodata_threshold_percent=5):
+def analyze_months_and_filter(downloaded_images):
     """
-    Find patches that are valid across ALL months.
-    Returns: Combined validity mask (True = valid in all months)
-    """
-    st.info("🔍 Analyzing patch validity across all months...")
+    Analyze all downloaded images, count valid patches per month,
+    and REMOVE months that have fewer patches than the maximum.
     
-    combined_mask = None
-    original_size = None
-    patch_grid_size = None
+    Returns:
+        - valid_months: dict of {month_name: image_path} for months that passed
+        - deleted_months: list of month names that were removed
+        - common_valid_mask: validity mask for patches valid in ALL remaining months
+        - original_size: (h, w) of images
+        - validity_report: detailed report per month
+    """
+    st.info("🔍 Analyzing patch validity across all months (STRICT mode: any zero/NaN = invalid)...")
     
     month_names = sorted(downloaded_images.keys())
     
+    # First pass: count valid patches per month
+    validity_data = {}
+    original_size = None
+    patch_grid_size = None
+    
     progress_bar = st.progress(0)
-    validity_report = []
     
     for idx, month_name in enumerate(month_names):
         image_path = downloaded_images[month_name]
         
-        validity_mask, orig_size, grid_size, nodata_info = get_patch_validity_mask(
-            image_path, PATCH_SIZE, nodata_threshold_percent
-        )
+        validity_mask, orig_size, grid_size = get_patch_validity_mask_strict(image_path, PATCH_SIZE)
         
         if validity_mask is None:
             st.warning(f"Could not check {month_name}")
             continue
         
-        if combined_mask is None:
-            combined_mask = validity_mask.copy()
+        if original_size is None:
             original_size = orig_size
             patch_grid_size = grid_size
-        else:
-            # Combine: only keep patches valid in ALL months
-            combined_mask = combined_mask & validity_mask
         
-        # Report for this month
         valid_count = np.sum(validity_mask)
         total_count = validity_mask.size
-        validity_report.append({
-            'month': month_name,
-            'valid': valid_count,
-            'total': total_count,
+        
+        validity_data[month_name] = {
+            'mask': validity_mask,
+            'valid_count': valid_count,
+            'total_count': total_count,
             'percent': 100 * valid_count / total_count,
-            'nodata_patches': len(nodata_info)
-        })
+            'image_path': image_path
+        }
         
         progress_bar.progress((idx + 1) / len(month_names))
     
     progress_bar.empty()
     
-    # Display validity report
-    st.subheader("📊 Patch Validity Report")
+    if not validity_data:
+        st.error("❌ No valid data from any month!")
+        return None, [], None, None, []
     
-    report_cols = st.columns(4)
-    for idx, report in enumerate(validity_report):
-        col_idx = idx % 4
-        with report_cols[col_idx]:
-            st.metric(
-                report['month'],
-                f"{report['valid']}/{report['total']}",
-                f"{report['percent']:.1f}% valid"
-            )
+    # Find the MAXIMUM number of valid patches across all months
+    max_valid_patches = max(v['valid_count'] for v in validity_data.values())
     
-    if combined_mask is not None:
-        final_valid = np.sum(combined_mask)
-        total = combined_mask.size
-        
-        st.divider()
-        st.success(f"✅ Found **{final_valid}/{total}** patches valid across ALL months ({100*final_valid/total:.1f}%)")
-        
-        if final_valid == 0:
-            st.error("❌ No patches are valid across all months! Try:")
-            st.write("- Selecting a different region")
-            st.write("- Choosing a different time period")
-            st.write("- Increasing the nodata threshold")
-            return None, None, None
+    st.info(f"📊 Maximum valid patches found: {max_valid_patches} out of {patch_grid_size[0] * patch_grid_size[1]} total")
     
-    return combined_mask, original_size, patch_grid_size
+    # Separate months into valid (have max patches) and deleted (fewer patches)
+    valid_months = {}
+    deleted_months = []
+    
+    for month_name, data in validity_data.items():
+        if data['valid_count'] == max_valid_patches:
+            valid_months[month_name] = data['image_path']
+        else:
+            deleted_months.append(month_name)
+    
+    # Create report
+    validity_report = []
+    for month_name in month_names:
+        if month_name in validity_data:
+            data = validity_data[month_name]
+            status = "✅ KEPT" if month_name in valid_months else "❌ DELETED"
+            validity_report.append({
+                'month': month_name,
+                'valid': data['valid_count'],
+                'total': data['total_count'],
+                'percent': data['percent'],
+                'status': status
+            })
+    
+    # Now find the common valid patches among REMAINING months
+    if not valid_months:
+        st.error("❌ No months passed the validation criteria!")
+        return None, deleted_months, None, None, validity_report
+    
+    # Compute intersection of valid patches across all remaining months
+    common_valid_mask = None
+    for month_name in valid_months:
+        month_mask = validity_data[month_name]['mask']
+        if common_valid_mask is None:
+            common_valid_mask = month_mask.copy()
+        else:
+            common_valid_mask = common_valid_mask & month_mask
+    
+    final_valid_patches = np.sum(common_valid_mask)
+    
+    # Sanity check: all remaining months should have the same valid patches
+    if final_valid_patches != max_valid_patches:
+        st.warning(f"⚠️ After intersection, {final_valid_patches} patches are common (expected {max_valid_patches})")
+    
+    return valid_months, deleted_months, common_valid_mask, original_size, validity_report
 
 
 def classify_image_with_mask(image_path, model, device, month_name, valid_mask, original_size):
@@ -908,7 +938,7 @@ def classify_image_with_mask(image_path, model, device, month_name, valid_mask, 
 
 
 # =============================================================================
-# Generate Thumbnails - KEPT FROM V04
+# Generate Thumbnails
 # =============================================================================
 def generate_thumbnails(image_path, classification_mask, month_name, max_size=256):
     """Generate both RGB and classification thumbnails."""
@@ -940,9 +970,9 @@ def generate_thumbnails(image_path, classification_mask, month_name, max_size=25
 
 
 # =============================================================================
-# Main Processing Pipeline - TWO PHASES with CACHE SUPPORT
+# Main Processing Pipeline - THREE PHASES
 # =============================================================================
-def download_all_images(composites, aoi, temp_dir, cloudy_pixel_percentage=10, scale=10, resume=False):
+def download_all_images(composites, aoi, temp_dir, scale=10, resume=False):
     """
     PHASE 1: Download all monthly images.
     Supports resuming from previous downloads (cache).
@@ -974,7 +1004,6 @@ def download_all_images(composites, aoi, temp_dir, cloudy_pixel_percentage=10, s
         
         image_path = download_monthly_image(
             aoi, month_info, temp_dir,
-            cloudy_pixel_percentage=cloudy_pixel_percentage,
             scale=scale,
             status_placeholder=status_text
         )
@@ -996,9 +1025,9 @@ def download_all_images(composites, aoi, temp_dir, cloudy_pixel_percentage=10, s
     return downloaded_images, failed_months
 
 
-def classify_all_images(downloaded_images, model, device, valid_mask, original_size, resume=False):
+def classify_all_images(valid_months, model, device, valid_mask, original_size, resume=False):
     """
-    PHASE 3: Classify all downloaded images using the valid patch mask.
+    PHASE 3: Classify all validated images using the valid patch mask.
     Supports resuming from previous classifications (cache).
     """
     thumbnails = []
@@ -1010,7 +1039,7 @@ def classify_all_images(downloaded_images, model, device, valid_mask, original_s
         already_processed = set()
         st.session_state.processed_months = {}
     
-    month_names = sorted(downloaded_images.keys())
+    month_names = sorted(valid_months.keys())
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -1024,7 +1053,7 @@ def classify_all_images(downloaded_images, model, device, valid_mask, original_s
             progress_bar.progress((idx + 1) / len(month_names))
             continue
         
-        image_path = downloaded_images[month_name]
+        image_path = valid_months[month_name]
         status_text.text(f"🧠 Classifying {month_name} ({idx+1}/{len(month_names)})...")
         
         classification_mask, valid_count, skipped_count = classify_image_with_mask(
@@ -1048,14 +1077,12 @@ def classify_all_images(downloaded_images, model, device, valid_mask, original_s
     return thumbnails
 
 
-def process_timeseries_with_nodata_handling(aoi, start_date, end_date, model, device,
-                                             cloudy_pixel_percentage=10, scale=10,
-                                             nodata_threshold_percent=5, resume=False):
+def process_timeseries_strict(aoi, start_date, end_date, model, device, scale=10, resume=False):
     """
     Main processing pipeline with THREE PHASES:
     1. Download all images (with cache)
-    2. Analyze patch validity across all months
-    3. Classify only valid patches (with cache)
+    2. Analyze patch validity and DELETE months with fewer patches
+    3. Classify only valid patches in remaining months (with cache)
     """
     try:
         # Setup temp directory
@@ -1066,8 +1093,9 @@ def process_timeseries_with_nodata_handling(aoi, start_date, end_date, model, de
         st.info(f"📁 Working directory: {temp_dir}")
         
         # Get month list
-        composites, total_months = create_monthly_composites_list(aoi, start_date, end_date, cloudy_pixel_percentage)
-        st.info(f"📅 Processing {total_months} months...")
+        composites, total_months = create_monthly_composites_list(aoi, start_date, end_date)
+        st.session_state.total_requested_months = total_months
+        st.info(f"📅 Requested: {total_months} months")
         
         # =====================================================================
         # PHASE 1: Download all images (with cache support)
@@ -1076,7 +1104,6 @@ def process_timeseries_with_nodata_handling(aoi, start_date, end_date, model, de
         
         downloaded_images, failed_downloads = download_all_images(
             composites, aoi, temp_dir,
-            cloudy_pixel_percentage=cloudy_pixel_percentage,
             scale=scale,
             resume=resume
         )
@@ -1085,6 +1112,7 @@ def process_timeseries_with_nodata_handling(aoi, start_date, end_date, model, de
             st.error("❌ No images could be downloaded!")
             return []
         
+        # Report download results
         st.success(f"✅ Downloaded {len(downloaded_images)}/{total_months} months")
         
         if failed_downloads:
@@ -1094,45 +1122,95 @@ def process_timeseries_with_nodata_handling(aoi, start_date, end_date, model, de
         st.session_state.download_phase_complete = True
         
         # =====================================================================
-        # PHASE 2: Analyze patch validity
+        # PHASE 2: Analyze validity and DELETE months with fewer patches
         # =====================================================================
-        st.header("Phase 2: Finding Valid Patches")
+        st.header("Phase 2: Analyzing Patch Validity & Filtering Months")
         
-        # Only re-analyze if not already done or if downloads changed
-        if (not st.session_state.validity_analysis_complete or 
-            st.session_state.valid_patches_mask is None):
-            
-            valid_mask, original_size, patch_grid_size = find_common_valid_patches(
-                downloaded_images, nodata_threshold_percent
+        valid_months, deleted_months, valid_mask, original_size, validity_report = analyze_months_and_filter(
+            downloaded_images
+        )
+        
+        if valid_months is None or len(valid_months) == 0:
+            st.error("❌ No months passed validation!")
+            return []
+        
+        # Store results
+        st.session_state.valid_months = list(valid_months.keys())
+        st.session_state.deleted_months = deleted_months
+        st.session_state.valid_patches_mask = valid_mask
+        st.session_state.original_size = original_size
+        st.session_state.validity_analysis_complete = True
+        
+        # =====================================================================
+        # Display Validity Report
+        # =====================================================================
+        st.subheader("📊 Validity Report by Month")
+        
+        # Create columns for the report
+        report_cols = st.columns(4)
+        for idx, report in enumerate(validity_report):
+            col_idx = idx % 4
+            with report_cols[col_idx]:
+                if "KEPT" in report['status']:
+                    st.success(f"**{report['month']}**\n{report['valid']}/{report['total']} patches\n{report['percent']:.1f}%")
+                else:
+                    st.error(f"**{report['month']}**\n{report['valid']}/{report['total']} patches\n{report['percent']:.1f}%")
+        
+        st.divider()
+        
+        # Summary statistics
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric(
+                "Months Requested",
+                total_months
             )
-            
-            if valid_mask is None:
-                return []
-            
-            st.session_state.valid_patches_mask = valid_mask
-            st.session_state.original_size = original_size
-            st.session_state.patch_grid_size = patch_grid_size
-            st.session_state.validity_analysis_complete = True
-            
-            # Visualize valid patch mask
+        
+        with col2:
+            st.metric(
+                "Months with Valid Data",
+                len(valid_months),
+                delta=f"-{len(deleted_months)} deleted" if deleted_months else None,
+                delta_color="inverse"
+            )
+        
+        with col3:
+            valid_patch_count = np.sum(valid_mask) if valid_mask is not None else 0
+            total_patches = valid_mask.size if valid_mask is not None else 0
+            st.metric(
+                "Valid Patches per Month",
+                f"{valid_patch_count}/{total_patches}"
+            )
+        
+        # Show deleted months explicitly
+        if deleted_months:
+            st.warning(f"🗑️ **Deleted months** (fewer valid patches): {', '.join(deleted_months)}")
+        
+        # Important summary message
+        st.success(f"""
+        📊 **Summary**: Out of **{total_months}** months requested, **{len(valid_months)}** months have complete, 
+        cloud-free Sentinel-2 data with **{np.sum(valid_mask)}** valid patches each.
+        
+        These {len(valid_months)} months will be used for time series analysis.
+        """)
+        
+        # Visualize valid patch mask
+        if valid_mask is not None:
             fig, ax = plt.subplots(figsize=(8, 6))
             ax.imshow(valid_mask, cmap='RdYlGn', vmin=0, vmax=1)
-            ax.set_title(f"Valid Patches Mask\nGreen = Valid in ALL months, Red = Has nodata")
+            ax.set_title(f"Valid Patches Mask\nGreen = Valid in ALL {len(valid_months)} months, Red = Invalid")
             ax.set_xlabel("Patch Column")
             ax.set_ylabel("Patch Row")
             st.pyplot(fig)
-        else:
-            valid_mask = st.session_state.valid_patches_mask
-            original_size = st.session_state.original_size
-            st.info("✅ Using cached validity analysis")
         
         # =====================================================================
-        # PHASE 3: Classify all images (with cache support)
+        # PHASE 3: Classify all validated images (with cache support)
         # =====================================================================
         st.header("Phase 3: Classifying Images")
         
         thumbnails = classify_all_images(
-            downloaded_images, model, device, 
+            valid_months, model, device, 
             valid_mask, original_size,
             resume=resume
         )
@@ -1150,7 +1228,7 @@ def process_timeseries_with_nodata_handling(aoi, start_date, end_date, model, de
 
 
 # =============================================================================
-# Display Thumbnails - KEPT FROM V04
+# Display Thumbnails
 # =============================================================================
 def display_classification_thumbnails(thumbnails):
     """Display RGB and classification thumbnails side by side."""
@@ -1245,14 +1323,15 @@ def display_classification_thumbnails(thumbnails):
 # Main Application
 # =============================================================================
 def main():
-    st.title("🏗️ Building Classification Time Series v05")
+    st.title("🏗️ Building Classification Time Series v06")
     st.markdown("""
     **Features:**
-    - ✅ Smart nodata handling: Only processes patches valid in ALL months
-    - ✅ Full cache support: Resume interrupted downloads
-    - ✅ Raw DN values (no 0.0001 scaling)
-    - ✅ Per-patch global normalization (matches working app)
-    - ✅ RGB thumbnails alongside classifications
+    - ✅ **STRICT nodata handling**: Any zero or NaN pixel = invalid patch
+    - ✅ **Month filtering**: Months with fewer valid patches are automatically DELETED
+    - ✅ **Consistent time series**: All remaining months have identical valid patch coverage
+    - ✅ **Full cache support**: Resume interrupted downloads
+    - ✅ **Fixed 10% cloud cover threshold**
+    - ✅ **Reports**: Shows how many months have valid cloud-free data
     """)
     
     # Initialize Earth Engine
@@ -1291,31 +1370,27 @@ def main():
     else:
         st.sidebar.success("✅ Model already loaded")
     
-    # Sidebar - Parameters
+    # Sidebar - Parameters (no nodata threshold slider - it's always strict)
     st.sidebar.header("⚙️ Parameters")
+    st.sidebar.info(f"☁️ Cloud cover threshold: **{CLOUDY_PIXEL_PERCENTAGE}%** (fixed)")
+    st.sidebar.info("🔒 Nodata handling: **STRICT** (any zero = invalid)")
     
-    cloudy_pixel_percentage = st.sidebar.slider(
-        "Max Cloud Cover %", 0, 100, 20, 5
-    )
-    
-    nodata_threshold_percent = st.sidebar.slider(
-        "Nodata Threshold %",
-        min_value=1, max_value=50, value=5, step=1,
-        help="Patches with more than this % of zero values will be considered invalid"
-    )
-    
-    # Sidebar - Cache Management (KEPT FROM V04)
+    # Sidebar - Cache Management
     st.sidebar.header("🗂️ Cache Management")
     
     cache_info = []
     if st.session_state.downloaded_images:
         cache_info.append(f"📥 {len(st.session_state.downloaded_images)} images downloaded")
+    if st.session_state.valid_months:
+        cache_info.append(f"✅ {len(st.session_state.valid_months)} months validated")
+    if st.session_state.deleted_months:
+        cache_info.append(f"🗑️ {len(st.session_state.deleted_months)} months deleted")
     if st.session_state.processed_months:
         cache_info.append(f"🧠 {len(st.session_state.processed_months)} months classified")
     if st.session_state.valid_patches_mask is not None:
         valid_count = np.sum(st.session_state.valid_patches_mask)
         total_count = st.session_state.valid_patches_mask.size
-        cache_info.append(f"✅ {valid_count}/{total_count} valid patches")
+        cache_info.append(f"📊 {valid_count}/{total_count} valid patches")
     
     if cache_info:
         for info in cache_info:
@@ -1336,6 +1411,9 @@ def main():
         st.session_state.valid_patches_mask = None
         st.session_state.download_phase_complete = False
         st.session_state.validity_analysis_complete = False
+        st.session_state.valid_months = []
+        st.session_state.deleted_months = []
+        st.session_state.total_requested_months = 0
         st.sidebar.success("Cache cleared!")
         st.rerun()
     
@@ -1494,6 +1572,9 @@ def main():
         st.session_state.download_phase_complete = False
         st.session_state.validity_analysis_complete = False
         st.session_state.current_temp_dir = None
+        st.session_state.valid_months = []
+        st.session_state.deleted_months = []
+        st.session_state.total_requested_months = 0
         
     elif resume_processing:
         should_process = True
@@ -1517,14 +1598,13 @@ def main():
         geojson = {"type": "Polygon", "coordinates": [list(selected_polygon.exterior.coords)]}
         aoi = ee.Geometry.Polygon(geojson['coordinates'])
         
-        thumbnails = process_timeseries_with_nodata_handling(
+        thumbnails = process_timeseries_strict(
             aoi=aoi,
             start_date=start_date.strftime('%Y-%m-%d'),
             end_date=end_date.strftime('%Y-%m-%d'),
             model=st.session_state.model,
             device=st.session_state.device,
-            cloudy_pixel_percentage=cloudy_pixel_percentage,
-            nodata_threshold_percent=nodata_threshold_percent,
+            scale=10,
             resume=resume_mode
         )
         
@@ -1537,10 +1617,15 @@ def main():
         st.divider()
         st.header("📊 Results")
         
-        if st.session_state.valid_patches_mask is not None:
-            valid_count = np.sum(st.session_state.valid_patches_mask)
-            total_count = st.session_state.valid_patches_mask.size
-            st.info(f"Showing {len(st.session_state.classification_thumbnails)} months using {valid_count}/{total_count} patches ({100*valid_count/total_count:.1f}%) valid across all months")
+        # Show summary
+        if st.session_state.valid_months and st.session_state.total_requested_months > 0:
+            st.success(f"""
+            **Final Summary**: 
+            - Requested: {st.session_state.total_requested_months} months
+            - Valid (cloud-free): {len(st.session_state.valid_months)} months
+            - Deleted: {len(st.session_state.deleted_months)} months
+            - Valid patches per month: {np.sum(st.session_state.valid_patches_mask)}/{st.session_state.valid_patches_mask.size}
+            """)
         
         display_classification_thumbnails(st.session_state.classification_thumbnails)
 
