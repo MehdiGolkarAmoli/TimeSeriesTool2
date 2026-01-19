@@ -10,9 +10,6 @@ Workflow:
 4. Display classification thumbnails (binary masks)
 """
 
-# =============================================================================
-# Import non-streamlit packages first
-# =============================================================================
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
@@ -57,18 +54,12 @@ st.set_page_config(
     page_icon="🏗️"
 )
 
-# =============================================================================
-# Now import other streamlit-related packages
-# =============================================================================
 import folium
 from folium import plugins
 from streamlit_folium import st_folium
 import segmentation_models_pytorch as smp
 from tqdm import tqdm
 
-# =============================================================================
-# Constants
-# =============================================================================
 SPECTRAL_BANDS = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12']
 PATCH_SIZE = 224
 
@@ -78,9 +69,6 @@ RETRY_DELAY_BASE = 2  # seconds (exponential backoff: 2, 4, 8...)
 DOWNLOAD_TIMEOUT = 120  # seconds per band
 CHUNK_SIZE = 8192
 
-# =============================================================================
-# Session State Initialization
-# =============================================================================
 if 'drawn_polygons' not in st.session_state:
     st.session_state.drawn_polygons = []
 if 'last_drawn_polygon' not in st.session_state:
