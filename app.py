@@ -604,7 +604,7 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
     masked_pixels_after = masked_pixels_after.getInfo()
     masked_percent_after = masked_percent_after.getInfo()
     if masked_percent_before > 30:
-    status = "skipped"
+        status = "skipped"
 
     elif masked_pixels_after > 0:
         status = "rejected"
