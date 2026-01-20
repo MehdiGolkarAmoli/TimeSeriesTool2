@@ -362,9 +362,10 @@ def iterative_gap_fill(median_composite, candidate_images_list, aoi, month_middl
     
     For each candidate image (sorted by time distance, closest first):
     1. Apply cloud detection on the candidate
-    2. Find pixels that are masked in current composite BUT cloud-free in candidate
-    3. Fill those pixels
-    4. Continue until no masked pixels remain
+    2. Check candidate has valid data at the pixel location
+    3. Find pixels that are masked in current composite BUT cloud-free AND has data in candidate
+    4. Fill those pixels
+    5. Continue until no masked pixels remain
     """
     
     initial_state = ee.Dictionary({
@@ -395,8 +396,14 @@ def iterative_gap_fill(median_composite, candidate_images_list, aoi, month_middl
         # Scale candidate spectral bands and clip to AOI
         candidate_scaled = candidate_img.select(SPECTRAL_BANDS).multiply(0.0001).clip(aoi)
         
-        # Find pixels that are: still masked AND cloud-free in this candidate
-        can_fill = still_masked.And(candidate_cloud_free)
+        # IMPORTANT: Check if candidate actually has valid data (not masked/no data)
+        candidate_has_data = candidate_scaled.select('B4').mask()
+        
+        # Find pixels that are:
+        # 1. Still masked in our composite (still_masked = True)
+        # 2. Cloud-free in this candidate (candidate_cloud_free = True)
+        # 3. Has valid data in candidate (candidate_has_data = True)
+        can_fill = still_masked.And(candidate_cloud_free).And(candidate_has_data)
         
         # Fill those pixels
         filled_composite = current_composite.where(can_fill, candidate_scaled)
@@ -456,23 +463,34 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
     median_composite = cloud_free_monthly.median()
     
     # Calculate masked pixel percentage BEFORE gap-filling
+    # Use selfMask to get proper binary mask, then count
     valid_mask = median_composite.select('B4').mask()
     
-    # Count masked and valid pixels
-    pixel_counts = valid_mask.reduceRegion(
+    # Count valid pixels (where mask = 1) and total pixels
+    # Use gt(0) to ensure binary mask
+    binary_valid = valid_mask.gt(0)
+    
+    pixel_stats = binary_valid.reduceRegion(
         reducer=ee.Reducer.sum().combine(ee.Reducer.count(), sharedInputs=True),
         geometry=aoi,
         scale=10,
         maxPixels=1e9
     )
     
-    valid_pixels = ee.Number(pixel_counts.get('B4_sum')).getInfo()
-    total_pixels = ee.Number(pixel_counts.get('B4_count')).getInfo()
+    valid_pixels_raw = pixel_stats.get('B4_sum')
+    total_pixels_raw = pixel_stats.get('B4_count')
+    
+    valid_pixels = ee.Number(valid_pixels_raw).round().getInfo()
+    total_pixels = ee.Number(total_pixels_raw).round().getInfo()
     
     if total_pixels is None or total_pixels == 0:
         total_pixels = 1
     if valid_pixels is None:
         valid_pixels = 0
+    
+    # Convert to integers
+    valid_pixels = int(valid_pixels)
+    total_pixels = int(total_pixels)
     
     masked_pixels_before = total_pixels - valid_pixels
     masked_percent_before = 100 * masked_pixels_before / total_pixels
@@ -571,18 +589,23 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
     )
     
     # Calculate masked percentage AFTER gap-filling
-    filled_valid_mask = filled_composite.select('B4').mask()
+    filled_valid_mask = filled_composite.select('B4').mask().gt(0)
     
-    filled_counts = filled_valid_mask.reduceRegion(
+    filled_stats = filled_valid_mask.reduceRegion(
         reducer=ee.Reducer.sum(),
         geometry=aoi,
         scale=10,
         maxPixels=1e9
     )
     
-    filled_valid_pixels = ee.Number(filled_counts.get('B4')).getInfo()
+    filled_valid_pixels_raw = filled_stats.get('B4')
+    filled_valid_pixels = ee.Number(filled_valid_pixels_raw).round().getInfo()
+    
     if filled_valid_pixels is None:
         filled_valid_pixels = 0
+    
+    # Convert to integer
+    filled_valid_pixels = int(filled_valid_pixels)
     
     masked_pixels_after = total_pixels - filled_valid_pixels
     masked_percent_after = 100 * masked_pixels_after / total_pixels
@@ -935,9 +958,15 @@ def display_detailed_report(month_reports, total_months):
             
             with col2:
                 if masked_before != 'N/A':
-                    st.markdown(f"**Masked pixels (before):** {masked_before:,}")
+                    if isinstance(masked_before, (int, float)):
+                        st.markdown(f"**Masked pixels (before):** {int(masked_before):,}")
+                    else:
+                        st.markdown(f"**Masked pixels (before):** {masked_before}")
                 if masked_after != 'N/A' and masked_after != masked_before:
-                    st.markdown(f"**Masked pixels (after):** {masked_after:,}")
+                    if isinstance(masked_after, (int, float)):
+                        st.markdown(f"**Masked pixels (after):** {int(masked_after):,}")
+                    else:
+                        st.markdown(f"**Masked pixels (after):** {masked_after}")
             
             with col3:
                 if total_pixels != 'N/A':
@@ -963,12 +992,16 @@ def display_detailed_report(month_reports, total_months):
         if skipped:
             st.markdown(f"**Skipped ({len(skipped)})** - >{MAX_MASKED_PERCENT_FOR_GAPFILL}% masked:")
             for r in skipped:
-                st.markdown(f"- {r['month_name']} ({r['masked_pixels_before']:,} masked pixels, {r['masked_before']:.1f}%)")
+                mp = r.get('masked_pixels_before', 0)
+                mp = int(mp) if isinstance(mp, (int, float)) else mp
+                st.markdown(f"- {r['month_name']} ({mp:,} masked pixels, {r['masked_before']:.1f}%)")
         
         if rejected:
             st.markdown(f"**Rejected ({len(rejected)})** - still has masked pixels after gap-fill:")
             for r in rejected:
-                st.markdown(f"- {r['month_name']} ({r['masked_pixels_after']:,} masked pixels remaining)")
+                mp = r.get('masked_pixels_after', 0)
+                mp = int(mp) if isinstance(mp, (int, float)) else mp
+                st.markdown(f"- {r['month_name']} ({mp:,} masked pixels remaining)")
         
         if no_data:
             st.markdown(f"**No Data ({len(no_data)})** - no images with <{SCENE_CLOUD_THRESHOLD}% cloud:")
