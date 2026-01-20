@@ -1,14 +1,16 @@
 """
 Sentinel-2 Time Series Building Classification
-VERSION 08 - DETAILED REPORTING + PROPER DOWNLOAD
+VERSION 09 - FIXED GAP-FILLING (Matching JS Implementation)
+
+Key Fix: Create cloudFreeCollection FIRST, then use it for both
+monthly composites AND gap-filling (exactly like the JS code).
 
 Features:
 - Scene filter: CLOUDY_PIXEL_PERCENTAGE < 10%
 - Pixel cloud mask: probability > 65 AND CDI < -0.5 + 20m dilation
 - Pre-filter: Skip months with >30% masked pixels
-- Iterative gap-fill from M-1, M+1 (closest first)
+- Gap-fill from M-1, M+1 using MOSAIC (closest first)
 - Post-filter: Only download images with 0 masked pixels
-- DETAILED REPORT for each month before downloading
 """
 
 import os
@@ -47,7 +49,7 @@ import streamlit as st
 
 st.set_page_config(
     layout="wide", 
-    page_title="Building Classification v08 - Detailed Report",
+    page_title="Building Classification v09 - Fixed Gap-Fill",
     page_icon="🏗️"
 )
 
@@ -62,7 +64,7 @@ import segmentation_models_pytorch as smp
 SPECTRAL_BANDS = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12']
 PATCH_SIZE = 224
 
-# Cloud detection parameters (UNCHANGED)
+# Cloud detection parameters (UNCHANGED - same as JS)
 SCENE_CLOUD_THRESHOLD = 10          # Scene-level: CLOUDY_PIXEL_PERCENTAGE < 10%
 CLOUD_PROBABILITY_THRESHOLD = 65    # Pixel-level: probability > 65 = cloud
 CDI_THRESHOLD = -0.5                # Pixel-level: CDI < -0.5 = cloud
@@ -301,40 +303,18 @@ def get_utm_epsg(longitude, latitude):
 
 
 # =============================================================================
-# GEE: Get Raw Joined Collection (without cloud masking)
+# GEE: CLOUD MASKING FUNCTION (Exact match to JS)
 # =============================================================================
-def get_joined_collection(aoi, start_date, end_date):
+def mask_cloud_and_shadow(img, aoi):
     """
-    Get Sentinel-2 collection joined with cloud probability.
-    Only scene-level filter is applied here.
-    """
+    Apply cloud masking to a single image.
+    EXACTLY matches the JS function maskCloudAndShadow.
     
-    s2_sr = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-             .filterBounds(aoi)
-             .filterDate(start_date, end_date)
-             .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', SCENE_CLOUD_THRESHOLD))
-             .select(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12', 'SCL']))
-    
-    s2_cloud = (ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
-                .filterBounds(aoi)
-                .filterDate(start_date, end_date))
-    
-    s2_joined = ee.ImageCollection(ee.Join.saveFirst('cloud_prob').apply(
-        primary=s2_sr,
-        secondary=s2_cloud,
-        condition=ee.Filter.equals(leftField='system:index', rightField='system:index')
-    )).map(lambda img: img.addBands(ee.Image(img.get('cloud_prob'))))
-    
-    return s2_joined
-
-
-def apply_cloud_mask(img, aoi):
-    """
-    Apply pixel-based cloud masking to a single image.
-    
-    Cloud detection (UNCHANGED):
+    Cloud detection:
     - probability > 65 AND CDI < -0.5 = CLOUD
     - Dilate with 20m circle kernel, 2 iterations
+    
+    Returns: scaled spectral bands only, clipped to AOI
     """
     cloud_prob = img.select('probability')
     cdi = ee.Algorithms.Sentinel2.CDI(img)
@@ -342,107 +322,111 @@ def apply_cloud_mask(img, aoi):
     # Cloud detection: high probability AND low CDI
     is_cloud = cloud_prob.gt(CLOUD_PROBABILITY_THRESHOLD).And(cdi.lt(CDI_THRESHOLD))
     
-    # Dilate cloud mask
+    # Dilate cloud mask with 20m kernel, 2 iterations
     kernel = ee.Kernel.circle(radius=20, units='meters')
     cloud_dilated = is_cloud.focal_max(kernel=kernel, iterations=2)
     
-    # Apply mask and scale
+    # Apply mask
     masked = img.updateMask(cloud_dilated.Not())
+    
+    # Scale spectral bands and clip to AOI
     scaled = masked.select(SPECTRAL_BANDS).multiply(0.0001).clip(aoi)
     
     return scaled.copyProperties(img, ['system:time_start'])
 
 
-# =============================================================================
-# GEE: ITERATIVE GAP-FILLING
-# =============================================================================
-def iterative_gap_fill(median_composite, candidate_images_list, aoi, month_middle_millis):
+def get_cloud_free_collection(aoi, start_date, end_date):
     """
-    ITERATIVE gap-filling using ee.List.iterate().
+    Get Sentinel-2 cloud-free collection.
+    EXACTLY matches the JS data preparation section.
     
-    For each candidate image (sorted by time distance, closest first):
-    1. Apply cloud detection on the candidate
-    2. Check candidate has valid data at the pixel location
-    3. Find pixels that are masked in current composite BUT cloud-free AND has data in candidate
-    4. Fill those pixels
-    5. Continue until no masked pixels remain
+    Steps:
+    1. Get S2_SR_HARMONIZED with scene cloud filter
+    2. Get S2_CLOUD_PROBABILITY
+    3. Join them
+    4. Apply cloud masking to ALL images
+    
+    Returns: ImageCollection with cloud-masked, scaled spectral bands
     """
     
-    initial_state = ee.Dictionary({
-        'composite': median_composite,
-        'still_masked': median_composite.select('B4').mask().Not()  # True where masked
-    })
+    # S2 Surface Reflectance
+    s2_sr = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+             .filterBounds(aoi)
+             .filterDate(start_date, end_date)
+             .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', SCENE_CLOUD_THRESHOLD))
+             .select(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12', 'SCL']))
     
-    def fill_from_candidate(candidate_img, state):
-        """Fill masked pixels from a single candidate image."""
-        # IMPORTANT: Cast ComputedObject to ee.Image
-        candidate_img = ee.Image(candidate_img)
-        
-        state = ee.Dictionary(state)
-        current_composite = ee.Image(state.get('composite'))
-        still_masked = ee.Image(state.get('still_masked'))
-        
-        # Apply cloud detection on this candidate
-        cloud_prob = candidate_img.select('probability')
-        cdi = ee.Algorithms.Sentinel2.CDI(candidate_img)
-        
-        is_cloud = cloud_prob.gt(CLOUD_PROBABILITY_THRESHOLD).And(cdi.lt(CDI_THRESHOLD))
-        kernel = ee.Kernel.circle(radius=20, units='meters')
-        cloud_dilated = is_cloud.focal_max(kernel=kernel, iterations=2)
-        
-        # Get cloud-free pixels from candidate
-        candidate_cloud_free = cloud_dilated.Not()
-        
-        # Scale candidate spectral bands and clip to AOI
-        candidate_scaled = candidate_img.select(SPECTRAL_BANDS).multiply(0.0001).clip(aoi)
-        
-        # IMPORTANT: Check if candidate actually has valid data (not masked/no data)
-        candidate_has_data = candidate_scaled.select('B4').mask()
-        
-        # Find pixels that are:
-        # 1. Still masked in our composite (still_masked = True)
-        # 2. Cloud-free in this candidate (candidate_cloud_free = True)
-        # 3. Has valid data in candidate (candidate_has_data = True)
-        can_fill = still_masked.And(candidate_cloud_free).And(candidate_has_data)
-        
-        # Fill those pixels
-        filled_composite = current_composite.where(can_fill, candidate_scaled)
-        
-        # Update still_masked: remove pixels we just filled
-        new_still_masked = still_masked.And(can_fill.Not())
-        
-        return ee.Dictionary({
-            'composite': filled_composite,
-            'still_masked': new_still_masked
-        })
+    # Cloud Probability
+    s2_cloud = (ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
+                .filterBounds(aoi)
+                .filterDate(start_date, end_date))
     
-    # Iterate through all candidates
-    final_state = ee.Dictionary(candidate_images_list.iterate(fill_from_candidate, initial_state))
+    # Join collections (exactly like JS indexJoin)
+    joined = ee.ImageCollection(
+        ee.Join.saveFirst('cloud_probability').apply(
+            primary=s2_sr,
+            secondary=s2_cloud,
+            condition=ee.Filter.equals(
+                leftField='system:index',
+                rightField='system:index'
+            )
+        )
+    )
     
-    return ee.Image(final_state.get('composite'))
+    # Add cloud probability band to each image
+    def add_cloud_band(img):
+        return img.addBands(ee.Image(img.get('cloud_probability')))
+    
+    s2_joined = joined.map(add_cloud_band)
+    
+    # Apply cloud masking to ALL images (create cloudFreeCollection)
+    cloud_free_collection = s2_joined.map(lambda img: mask_cloud_and_shadow(img, aoi))
+    
+    return cloud_free_collection
 
 
-def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, month_start, month_end,
-                                                      origin, month_index, num_months, status_callback=None):
+# =============================================================================
+# GEE: MONTHLY COMPOSITE WITH GAP-FILLING (Exact match to JS)
+# =============================================================================
+def create_monthly_composite_with_gapfill(cloud_free_collection, aoi, origin, month_index, 
+                                           num_months, status_callback=None):
     """
-    Create a single monthly composite with ITERATIVE gap-filling.
+    Create a single monthly composite with gap-filling.
+    EXACTLY matches the JS gap-filling logic.
     
-    Returns detailed report for each month.
+    Gap-fill strategy (from JS):
+    1. Get current month composite (median)
+    2. Identify masked pixels (frequency == 0)
+    3. Collect images from M-1, M+1 (from cloudFreeCollection!)
+    4. Sort by time distance from middle of current month
+    5. Create mosaic (first valid pixel wins = closest in time)
+    6. Fill masked pixels from mosaic
+    
+    Returns: dict with image and status information
     """
     
-    month_name = ee.Date(month_start).format('YYYY-MM').getInfo()
+    month_index = ee.Number(month_index)
+    origin_date = ee.Date(origin)
+    
+    # Current month boundaries
+    month_start = origin_date.advance(month_index, 'month')
+    month_end = origin_date.advance(month_index.add(1), 'month')
+    month_middle = month_start.advance(15, 'day')
+    month_middle_millis = month_middle.millis()
+    
+    month_name = month_start.format('YYYY-MM').getInfo()
     
     if status_callback:
-        status_callback(f"Analyzing {month_name}...")
+        status_callback(f"Processing {month_name}...")
     
-    # Get images for current month
-    monthly_images = joined_collection.filterDate(month_start, month_end)
-    count = monthly_images.size().getInfo()
+    # Get images for current month (from cloud-free collection!)
+    monthly_images = cloud_free_collection.filterDate(month_start, month_end)
+    image_count = monthly_images.size().getInfo()
     
     # =========================================================================
     # CASE 1: No images available
     # =========================================================================
-    if count == 0:
+    if image_count == 0:
         return {
             'image': None,
             'status': 'no_data',
@@ -456,43 +440,41 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
             'total_pixels': 'N/A'
         }
     
-    # Apply cloud mask to monthly images
-    cloud_free_monthly = monthly_images.map(lambda img: apply_cloud_mask(img, aoi))
+    # Create median composite (exactly like JS)
+    median_composite = monthly_images.median()
     
-    # Create median composite
-    median_composite = cloud_free_monthly.median()
+    # Create frequency map (count of valid pixels per location)
+    # This matches JS: monthlyImages.map(...).sum()
+    def create_valid_mask(img):
+        return ee.Image(1).updateMask(img.select('B4').mask()).unmask(0).toInt()
     
-    # Calculate masked pixel percentage BEFORE gap-filling
-    # Use selfMask to get proper binary mask, then count
-    valid_mask = median_composite.select('B4').mask()
+    frequency_map = monthly_images.map(create_valid_mask).sum().toInt().rename('frequency')
     
-    # Count valid pixels (where mask = 1) and total pixels
-    # Use gt(0) to ensure binary mask
-    binary_valid = valid_mask.gt(0)
+    # Calculate masked pixels BEFORE gap-filling
+    gap_mask = frequency_map.eq(0)  # True where NO valid data
     
-    pixel_stats = binary_valid.reduceRegion(
-        reducer=ee.Reducer.sum().combine(ee.Reducer.count(), sharedInputs=True),
+    # Count pixels
+    pixel_stats = ee.Image.cat([
+        gap_mask.rename('masked'),
+        ee.Image(1).rename('total')
+    ]).reduceRegion(
+        reducer=ee.Reducer.sum(),
         geometry=aoi,
         scale=10,
-        maxPixels=1e9
+        maxPixels=1e13
     )
     
-    valid_pixels_raw = pixel_stats.get('B4_sum')
-    total_pixels_raw = pixel_stats.get('B4_count')
-    
-    valid_pixels = ee.Number(valid_pixels_raw).round().getInfo()
-    total_pixels = ee.Number(total_pixels_raw).round().getInfo()
+    masked_pixels_before = ee.Number(pixel_stats.get('masked')).round().getInfo()
+    total_pixels = ee.Number(pixel_stats.get('total')).round().getInfo()
     
     if total_pixels is None or total_pixels == 0:
         total_pixels = 1
-    if valid_pixels is None:
-        valid_pixels = 0
+    if masked_pixels_before is None:
+        masked_pixels_before = 0
     
-    # Convert to integers
-    valid_pixels = int(valid_pixels)
+    masked_pixels_before = int(masked_pixels_before)
     total_pixels = int(total_pixels)
     
-    masked_pixels_before = total_pixels - valid_pixels
     masked_percent_before = 100 * masked_pixels_before / total_pixels
     
     # =========================================================================
@@ -506,7 +488,7 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
             'masked_before': masked_percent_before,
             'masked_after': masked_percent_before,
             'month_name': month_name,
-            'image_count': count,
+            'image_count': image_count,
             'masked_pixels_before': masked_pixels_before,
             'masked_pixels_after': masked_pixels_before,
             'total_pixels': total_pixels
@@ -523,7 +505,7 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
             'masked_before': 0,
             'masked_after': 0,
             'month_name': month_name,
-            'image_count': count,
+            'image_count': image_count,
             'masked_pixels_before': 0,
             'masked_pixels_after': 0,
             'total_pixels': total_pixels,
@@ -536,24 +518,22 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
     if status_callback:
         status_callback(f"Gap-filling {month_name}...")
     
-    # Middle of current month for time distance calculation
-    month_middle = ee.Date(month_start).advance(15, 'day')
-    month_middle_millis = month_middle.millis()
-    
+    # Define search ranges for M-1, M+1 (exactly like JS)
     # M-1 (previous month)
-    m1_past_start = ee.Date(origin).advance(ee.Number(month_index).subtract(1), 'month')
-    m1_past_end = ee.Date(month_start)
+    m1_past_start = origin_date.advance(month_index.subtract(1), 'month')
+    m1_past_end = month_start
     
     # M+1 (next month)
-    m1_future_start = ee.Date(month_end)
-    m1_future_end = ee.Date(origin).advance(ee.Number(month_index).add(2), 'month')
+    m1_future_start = month_end
+    m1_future_end = origin_date.advance(month_index.add(2), 'month')
     
-    # Collect RAW candidate images (NOT cloud-masked yet!)
-    m1_past = joined_collection.filterDate(m1_past_start, m1_past_end)
-    m1_future = joined_collection.filterDate(m1_future_start, m1_future_end)
+    # Collect images from M-1 and M+1 (from cloudFreeCollection!)
+    m1_past_images = cloud_free_collection.filterDate(m1_past_start, m1_past_end)
+    m1_future_images = cloud_free_collection.filterDate(m1_future_start, m1_future_end)
     
-    candidates = m1_past.merge(m1_future)
-    candidate_count = candidates.size().getInfo()
+    # Merge all candidate images
+    all_candidate_images = m1_past_images.merge(m1_future_images)
+    candidate_count = all_candidate_images.size().getInfo()
     
     if candidate_count == 0:
         # No candidates available
@@ -564,50 +544,55 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
             'masked_before': masked_percent_before,
             'masked_after': masked_percent_before,
             'month_name': month_name,
-            'image_count': count,
+            'image_count': image_count,
             'masked_pixels_before': masked_pixels_before,
             'masked_pixels_after': masked_pixels_before,
             'total_pixels': total_pixels,
             'candidate_count': 0
         }
     
-    # Add time distance and sort (closest first)
+    # Add time distance property to each candidate (exactly like JS)
     def add_time_distance(img):
         img_time = ee.Number(img.get('system:time_start'))
-        time_dist = img_time.subtract(month_middle_millis).abs()
-        return img.set('time_distance', time_dist)
+        # Absolute time distance from middle of current month
+        time_diff = img_time.subtract(month_middle_millis).abs()
+        return img.set('time_distance', time_diff)
     
-    sorted_candidates = candidates.map(add_time_distance).sort('time_distance', True)
-    candidate_list = sorted_candidates.toList(candidate_count)
+    images_with_distance = all_candidate_images.map(add_time_distance)
     
-    # Perform ITERATIVE gap-filling
-    filled_composite = iterative_gap_fill(
-        median_composite,
-        candidate_list,
-        aoi,
-        month_middle_millis
-    )
+    # Sort by time distance (closest first) - exactly like JS
+    sorted_images = images_with_distance.sort('time_distance', True)
+    
+    # Create mosaic: first valid pixel wins (closest in time)
+    # This is EXACTLY what the JS code does!
+    closest_mosaic = sorted_images.mosaic().select(SPECTRAL_BANDS)
+    
+    # Check if mosaic has valid data at gap locations
+    has_closest = closest_mosaic.select('B4').mask()
+    
+    # Apply gap-filling (exactly like JS)
+    fill_from_closest = gap_mask.And(has_closest)
+    still_masked = gap_mask.And(has_closest.Not())
+    
+    # Fill gaps using unmask (exactly like JS)
+    filled_spectral = median_composite.unmask(closest_mosaic.updateMask(fill_from_closest))
     
     # Calculate masked percentage AFTER gap-filling
-    filled_valid_mask = filled_composite.select('B4').mask().gt(0)
+    filled_gap_mask = filled_spectral.select('B4').mask().Not()
     
-    filled_stats = filled_valid_mask.reduceRegion(
+    after_stats = filled_gap_mask.reduceRegion(
         reducer=ee.Reducer.sum(),
         geometry=aoi,
         scale=10,
-        maxPixels=1e9
+        maxPixels=1e13
     )
     
-    filled_valid_pixels_raw = filled_stats.get('B4')
-    filled_valid_pixels = ee.Number(filled_valid_pixels_raw).round().getInfo()
+    masked_pixels_after = ee.Number(after_stats.get('B4')).round().getInfo()
     
-    if filled_valid_pixels is None:
-        filled_valid_pixels = 0
+    if masked_pixels_after is None:
+        masked_pixels_after = 0
     
-    # Convert to integer
-    filled_valid_pixels = int(filled_valid_pixels)
-    
-    masked_pixels_after = total_pixels - filled_valid_pixels
+    masked_pixels_after = int(masked_pixels_after)
     masked_percent_after = 100 * masked_pixels_after / total_pixels
     
     # =========================================================================
@@ -621,7 +606,7 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
             'masked_before': masked_percent_before,
             'masked_after': masked_percent_after,
             'month_name': month_name,
-            'image_count': count,
+            'image_count': image_count,
             'masked_pixels_before': masked_pixels_before,
             'masked_pixels_after': masked_pixels_after,
             'total_pixels': total_pixels,
@@ -632,13 +617,13 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
     # CASE 4b: Gap-filling successful (0 masked pixels)
     # =========================================================================
     return {
-        'image': filled_composite,
+        'image': filled_spectral,
         'status': 'complete',
         'status_reason': f'Gap-filled successfully from {candidate_count} candidates - now has 0 masked pixels',
         'masked_before': masked_percent_before,
         'masked_after': 0,
         'month_name': month_name,
-        'image_count': count,
+        'image_count': image_count,
         'masked_pixels_before': masked_pixels_before,
         'masked_pixels_after': 0,
         'total_pixels': total_pixels,
@@ -1014,8 +999,11 @@ def display_detailed_report(month_reports, total_months):
 # =============================================================================
 # Main Processing Pipeline
 # =============================================================================
-def process_timeseries_with_iterative_gapfill(aoi, start_date, end_date, model, device, scale=10, resume=False):
-    """Main pipeline with ITERATIVE gap-filling and detailed reporting."""
+def process_timeseries_with_gapfill(aoi, start_date, end_date, model, device, scale=10, resume=False):
+    """
+    Main pipeline with gap-filling.
+    EXACTLY matches the JS workflow.
+    """
     try:
         if st.session_state.current_temp_dir is None or not os.path.exists(st.session_state.current_temp_dir):
             st.session_state.current_temp_dir = tempfile.mkdtemp()
@@ -1031,48 +1019,49 @@ def process_timeseries_with_iterative_gapfill(aoi, start_date, end_date, model, 
         st.session_state.total_requested_months = total_months
         st.info(f"📅 Requested: {total_months} months ({start_date} to {end_date})")
         
-        # Extended date range
+        # Extended date range for gap-filling (1 month before, 1 month after)
         extended_start = ee.Date(start_date).advance(-1, 'month')
         extended_end = ee.Date(end_date).advance(1, 'month')
         
         # =====================================================================
-        # PHASE 1: Load data
+        # PHASE 1: Create Cloud-Free Collection (exactly like JS!)
         # =====================================================================
-        st.header("Phase 1: Loading Sentinel-2 Data")
+        st.header("Phase 1: Creating Cloud-Free Collection")
         
-        with st.spinner("Loading data..."):
-            joined_collection = get_joined_collection(aoi, extended_start, extended_end)
-            total_images = joined_collection.size().getInfo()
-            st.success(f"✅ Found {total_images} images (scene cloud < {SCENE_CLOUD_THRESHOLD}%)")
+        with st.spinner("Loading and cloud-masking Sentinel-2 data..."):
+            cloud_free_collection = get_cloud_free_collection(aoi, extended_start, extended_end)
+            total_images = cloud_free_collection.size().getInfo()
+            st.success(f"✅ Created cloud-free collection with {total_images} images")
+            st.info(f"""
+            **Cloud Detection Applied:**
+            - Scene filter: `CLOUDY_PIXEL_PERCENTAGE < {SCENE_CLOUD_THRESHOLD}%`
+            - Pixel mask: `probability > {CLOUD_PROBABILITY_THRESHOLD} AND CDI < {CDI_THRESHOLD}` + 20m dilation
+            """)
         
         # =====================================================================
         # PHASE 2: Analyze each month
         # =====================================================================
-        st.header("Phase 2: Analyzing Each Month")
+        st.header("Phase 2: Creating Monthly Composites with Gap-Filling")
         
         st.info(f"""
-        **Analysis Pipeline:**
-        1. Scene filter: `CLOUDY_PIXEL_PERCENTAGE < {SCENE_CLOUD_THRESHOLD}%`
-        2. Pixel cloud mask: `probability > {CLOUD_PROBABILITY_THRESHOLD} AND CDI < {CDI_THRESHOLD}` + 20m dilation
-        3. Pre-filter: Skip if >{MAX_MASKED_PERCENT_FOR_GAPFILL}% masked (don't attempt gap-fill)
-        4. Gap-fill from M-1, M+1 (sorted by time distance, closest first)
-        5. Post-filter: Only download if 0 masked pixels
+        **Gap-Fill Strategy (matching JS):**
+        1. Create median composite from current month
+        2. If masked pixels exist and ≤{MAX_MASKED_PERCENT_FOR_GAPFILL}%:
+           - Collect cloud-free images from M-1, M+1
+           - Sort by time distance (closest first)
+           - Use mosaic to fill gaps (first valid pixel wins)
+        3. Only download if final image has 0 masked pixels
         """)
         
-        origin = ee.Date(start_date)
+        origin = start_date
         month_reports = []
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         for month_idx in range(total_months):
-            month_start = origin.advance(month_idx, 'month')
-            month_end = origin.advance(month_idx + 1, 'month')
-            
-            result = create_monthly_composite_with_iterative_gapfill(
-                aoi, joined_collection,
-                month_start, month_end,
-                origin, month_idx, total_months,
+            result = create_monthly_composite_with_gapfill(
+                cloud_free_collection, aoi, origin, month_idx, total_months,
                 status_callback=lambda msg: status_text.text(msg)
             )
             
@@ -1258,15 +1247,15 @@ def display_classification_thumbnails(thumbnails):
 # Main Application
 # =============================================================================
 def main():
-    st.title("🏗️ Building Classification v08 - Detailed Report")
+    st.title("🏗️ Building Classification v09 - Fixed Gap-Fill")
     st.markdown(f"""
-    **Cloud Detection Pipeline:**
+    **Cloud Detection Pipeline (Exact JS Match):**
     - ☁️ Scene filter: `CLOUDY_PIXEL_PERCENTAGE < {SCENE_CLOUD_THRESHOLD}%`
     - 🎯 Pixel mask: `probability > {CLOUD_PROBABILITY_THRESHOLD} AND CDI < {CDI_THRESHOLD}` + 20m dilation
+    - 📦 **Cloud-free collection created FIRST** (like JS `cloudFreeCollection`)
     - ⏭️ Pre-filter: Skip if >{MAX_MASKED_PERCENT_FOR_GAPFILL}% masked
-    - 🔄 Iterative gap-fill: M-1, M+1 (closest first)
+    - 🔄 Gap-fill: M-1, M+1 mosaic (closest first) from cloud-free collection
     - ✅ Download only: 0 masked pixels
-    - 📋 **Detailed report** for each month
     """)
     
     # Initialize Earth Engine
@@ -1399,7 +1388,7 @@ def main():
         geojson = {"type": "Polygon", "coordinates": [list(selected_polygon.exterior.coords)]}
         aoi = ee.Geometry.Polygon(geojson['coordinates'])
         
-        thumbnails = process_timeseries_with_iterative_gapfill(
+        thumbnails = process_timeseries_with_gapfill(
             aoi, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'),
             st.session_state.model, st.session_state.device, scale=10, resume=resume
         )
