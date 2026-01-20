@@ -484,14 +484,7 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
     masked_pixels_before = masked_pixels_before.getInfo()
     masked_percent_before = masked_percent_before.getInfo()
     total_pixels = total_pixels.getInfo()
-    
-    # Count masked and valid pixels
-    pixel_counts = valid_mask.reduceRegion(
-        reducer=ee.Reducer.sum().combine(ee.Reducer.count(), sharedInputs=True),
-        geometry=aoi,
-        scale=10,
-        maxPixels=1e9
-    )
+
     
     valid_pixels = ee.Number(pixel_counts.get('B4_sum')).getInfo()
     total_pixels = ee.Number(pixel_counts.get('B4_count')).getInfo()
