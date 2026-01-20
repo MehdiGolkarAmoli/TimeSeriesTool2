@@ -374,6 +374,9 @@ def iterative_gap_fill(median_composite, candidate_images_list, aoi, month_middl
     
     def fill_from_candidate(candidate_img, state):
         """Fill masked pixels from a single candidate image."""
+        # IMPORTANT: Cast ComputedObject to ee.Image
+        candidate_img = ee.Image(candidate_img)
+        
         state = ee.Dictionary(state)
         current_composite = ee.Image(state.get('composite'))
         still_masked = ee.Image(state.get('still_masked'))
@@ -389,8 +392,8 @@ def iterative_gap_fill(median_composite, candidate_images_list, aoi, month_middl
         # Get cloud-free pixels from candidate
         candidate_cloud_free = cloud_dilated.Not()
         
-        # Scale candidate spectral bands
-        candidate_scaled = candidate_img.select(SPECTRAL_BANDS).multiply(0.0001)
+        # Scale candidate spectral bands and clip to AOI
+        candidate_scaled = candidate_img.select(SPECTRAL_BANDS).multiply(0.0001).clip(aoi)
         
         # Find pixels that are: still masked AND cloud-free in this candidate
         can_fill = still_masked.And(candidate_cloud_free)
