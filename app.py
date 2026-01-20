@@ -454,9 +454,36 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
     
     # Create median composite
     median_composite = cloud_free_monthly.median()
+    def compute_masked_percentage(image, aoi, scale=10):
+        band = image.select('B4')
     
+        # 1 = valid, 0 = masked
+        valid = band.mask().rename('valid')
+    
+        # constant image for total pixels
+        total = ee.Image.constant(1).rename('total')
+    
+        stats = ee.Image.cat([valid, total]).reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi,
+            scale=scale,
+            maxPixels=1e9
+        )
+    
+        valid_pixels = ee.Number(stats.get('valid'))
+        total_pixels = ee.Number(stats.get('total'))
+    
+        masked_pixels = total_pixels.subtract(valid_pixels)
+        masked_percent = masked_pixels.divide(total_pixels).multiply(100)
+    
+        return masked_pixels, masked_percent, total_pixels
     # Calculate masked pixel percentage BEFORE gap-filling
-    valid_mask = median_composite.select('B4').mask()
+    masked_pixels_before, masked_percent_before, total_pixels = \
+    compute_masked_percentage(median_composite, aoi)
+
+    masked_pixels_before = masked_pixels_before.getInfo()
+    masked_percent_before = masked_percent_before.getInfo()
+    total_pixels = total_pixels.getInfo()
     
     # Count masked and valid pixels
     pixel_counts = valid_mask.reduceRegion(
@@ -571,8 +598,19 @@ def create_monthly_composite_with_iterative_gapfill(aoi, joined_collection, mont
     )
     
     # Calculate masked percentage AFTER gap-filling
-    filled_valid_mask = filled_composite.select('B4').mask()
+    masked_pixels_after, masked_percent_after, _ = \
+    compute_masked_percentage(filled_composite, aoi)
+
+    masked_pixels_after = masked_pixels_after.getInfo()
+    masked_percent_after = masked_percent_after.getInfo()
+    if masked_percent_before > 30:
+    status = "skipped"
+
+    elif masked_pixels_after > 0:
+        status = "rejected"
     
+    else:
+        status = "complete"    
     filled_counts = filled_valid_mask.reduceRegion(
         reducer=ee.Reducer.sum(),
         geometry=aoi,
