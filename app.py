@@ -125,7 +125,7 @@ if 'downloaded_images' not in st.session_state:
     st.session_state.downloaded_images = {}
 if 'valid_patches_mask' not in st.session_state:
     st.session_state.valid_patches_mask = None
-# NEW: For resume capability
+# For resume capability
 if 'month_analysis_results' not in st.session_state:
     st.session_state.month_analysis_results = {}
 if 'failed_downloads' not in st.session_state:
@@ -138,6 +138,13 @@ if 'cloud_free_collection' not in st.session_state:
     st.session_state.cloud_free_collection = None
 if 'processing_params' not in st.session_state:
     st.session_state.processing_params = None
+# NEW: For robust processing and region selection
+if 'selected_region_index' not in st.session_state:
+    st.session_state.selected_region_index = 0
+if 'processing_in_progress' not in st.session_state:
+    st.session_state.processing_in_progress = False
+if 'processing_config' not in st.session_state:
+    st.session_state.processing_config = None
 
 
 # =============================================================================
@@ -1145,14 +1152,16 @@ def main():
     st.sidebar.header("⚙️ Parameters")
     cloudy_pct = st.sidebar.slider(
         "Max Cloud % (metadata)", 0, 50, 10, 5,
-        help="GEE: Filter images by CLOUDY_PIXEL_PERCENTAGE metadata before cloud masking"
+        help="GEE: Filter images by CLOUDY_PIXEL_PERCENTAGE metadata before cloud masking",
+        disabled=st.session_state.processing_in_progress
     )
     nodata_pct = st.sidebar.slider(
         "Patch Nodata % (Python)", 1, 50, 5, 1,
         help="""AFTER download: Each 224x224 patch is checked for zeros/NaN.
         If a patch has more than this % of zeros in ANY month, 
         that patch is excluded from classification in ALL months.
-        This ensures consistent valid patches across the time series."""
+        This ensures consistent valid patches across the time series.""",
+        disabled=st.session_state.processing_in_progress
     )
     
     # Cache Status
@@ -1175,11 +1184,15 @@ def main():
     if st.session_state.failed_downloads:
         st.sidebar.warning(f"❌ Failed: {', '.join(st.session_state.failed_downloads)}")
     
-    if st.sidebar.button("🗑️ Clear All Cache"):
+    # Processing status indicator
+    if st.session_state.processing_in_progress:
+        st.sidebar.error("⏳ Processing in progress...")
+    
+    if st.sidebar.button("🗑️ Clear All Cache", disabled=st.session_state.processing_in_progress):
         for key in ['processed_months', 'downloaded_images', 'classification_thumbnails', 
                     'valid_patches_mask', 'current_temp_dir', 'month_analysis_results',
                     'failed_downloads', 'analysis_complete', 'download_complete',
-                    'processing_params']:
+                    'processing_params', 'processing_config']:
             if key in st.session_state:
                 if isinstance(st.session_state[key], dict):
                     st.session_state[key] = {}
@@ -1188,45 +1201,79 @@ def main():
                 else:
                     st.session_state[key] = None
         st.session_state.processing_complete = False
+        st.session_state.processing_in_progress = False
         st.rerun()
+    
+    # Stop processing button
+    if st.session_state.processing_in_progress:
+        if st.sidebar.button("🛑 Stop Processing", type="primary"):
+            st.session_state.processing_in_progress = False
+            st.session_state.processing_config = None
+            st.warning("⚠️ Processing stopped. You can resume later.")
+            st.rerun()
     
     # Region Selection
     st.header("1️⃣ Region")
     
-    m = folium.Map(location=[35.6892, 51.3890], zoom_start=8)
-    plugins.Draw(export=True, position='topleft', draw_options={
-        'polyline': False, 'rectangle': True, 'polygon': True,
-        'circle': False, 'marker': False, 'circlemarker': False
-    }).add_to(m)
-    folium.TileLayer(tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
-                     attr='Google', name='Satellite').add_to(m)
-    folium.LayerControl().add_to(m)
+    # Only show map if not processing
+    if not st.session_state.processing_in_progress:
+        m = folium.Map(location=[35.6892, 51.3890], zoom_start=8)
+        plugins.Draw(export=True, position='topleft', draw_options={
+            'polyline': False, 'rectangle': True, 'polygon': True,
+            'circle': False, 'marker': False, 'circlemarker': False
+        }).add_to(m)
+        folium.TileLayer(tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+                         attr='Google', name='Satellite').add_to(m)
+        folium.LayerControl().add_to(m)
+        
+        map_data = st_folium(m, width=800, height=500)
+        
+        if map_data and map_data.get('last_active_drawing'):
+            geom = map_data['last_active_drawing'].get('geometry', {})
+            if geom.get('type') == 'Polygon':
+                st.session_state.last_drawn_polygon = Polygon(geom['coordinates'][0])
+                st.success(f"✅ Region selected")
+        
+        if st.button("💾 Save Region"):
+            if st.session_state.last_drawn_polygon:
+                # Check if not already saved
+                is_duplicate = False
+                for existing in st.session_state.drawn_polygons:
+                    if existing.equals(st.session_state.last_drawn_polygon):
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    st.session_state.drawn_polygons.append(st.session_state.last_drawn_polygon)
+                    st.success("✅ Region saved!")
+                    st.rerun()
+                else:
+                    st.warning("⚠️ This region is already saved")
+            else:
+                st.warning("⚠️ Draw a region first")
+    else:
+        st.info("🔒 Map is locked during processing")
     
-    map_data = st_folium(m, width=800, height=500)
-    
-    if map_data and map_data.get('last_active_drawing'):
-        geom = map_data['last_active_drawing'].get('geometry', {})
-        if geom.get('type') == 'Polygon':
-            st.session_state.last_drawn_polygon = Polygon(geom['coordinates'][0])
-            st.success(f"✅ Region selected")
-    
-    if st.button("💾 Save"):
-        if st.session_state.last_drawn_polygon:
-            st.session_state.drawn_polygons.append(st.session_state.last_drawn_polygon)
-    
+    # Saved Regions List
     if st.session_state.drawn_polygons:
+        st.subheader("📍 Saved Regions")
         for i, p in enumerate(st.session_state.drawn_polygons):
-            c1, c2 = st.columns([4, 1])
-            c1.write(f"Region {i+1}: ~{p.area * 111 * 111:.2f} km²")
-            if c2.button("🗑️", key=f"d{i}"):
+            c1, c2, c3 = st.columns([3, 1, 1])
+            centroid = p.centroid
+            c1.write(f"**Region {i+1}**: ~{p.area * 111 * 111:.2f} km² | Center: ({centroid.y:.4f}, {centroid.x:.4f})")
+            c2.write(f"UTM Zone {get_utm_zone(centroid.x)}")
+            if c3.button("🗑️", key=f"del_{i}", disabled=st.session_state.processing_in_progress):
                 st.session_state.drawn_polygons.pop(i)
+                # Adjust selected index if needed
+                if st.session_state.selected_region_index >= len(st.session_state.drawn_polygons):
+                    st.session_state.selected_region_index = max(0, len(st.session_state.drawn_polygons) - 1)
                 st.rerun()
     
     # Date
     st.header("2️⃣ Time Period")
     c1, c2 = st.columns(2)
-    start = c1.date_input("Start", value=date(2024, 1, 1))
-    end = c2.date_input("End", value=date(2025, 1, 1))
+    start = c1.date_input("Start", value=date(2024, 1, 1), disabled=st.session_state.processing_in_progress)
+    end = c2.date_input("End", value=date(2025, 1, 1), disabled=st.session_state.processing_in_progress)
     
     if start >= end:
         st.error("Invalid dates")
@@ -1238,22 +1285,69 @@ def main():
     # Process
     st.header("3️⃣ Process")
     
-    poly = st.session_state.drawn_polygons[0] if st.session_state.drawn_polygons else st.session_state.last_drawn_polygon
+    # Region selection dropdown
+    selected_polygon = None
+    
+    if st.session_state.drawn_polygons:
+        # Create options for dropdown
+        region_options = []
+        for i, p in enumerate(st.session_state.drawn_polygons):
+            area = p.area * 111 * 111
+            region_options.append(f"Region {i+1} (~{area:.2f} km²)")
+        
+        # Ensure selected index is valid
+        if st.session_state.selected_region_index >= len(st.session_state.drawn_polygons):
+            st.session_state.selected_region_index = 0
+        
+        selected_idx = st.selectbox(
+            "🎯 Select Region to Process",
+            range(len(region_options)),
+            format_func=lambda i: region_options[i],
+            index=st.session_state.selected_region_index,
+            disabled=st.session_state.processing_in_progress,
+            key="region_selector"
+        )
+        
+        st.session_state.selected_region_index = selected_idx
+        selected_polygon = st.session_state.drawn_polygons[selected_idx]
+        
+        # Show selected region info
+        centroid = selected_polygon.centroid
+        st.success(f"✅ Selected: Region {selected_idx + 1} | Area: ~{selected_polygon.area * 111 * 111:.2f} km² | UTM Zone {get_utm_zone(centroid.x)}")
+        
+    elif st.session_state.last_drawn_polygon is not None:
+        selected_polygon = st.session_state.last_drawn_polygon
+        st.info("ℹ️ Using unsaved drawn region (save it to keep)")
+    else:
+        st.warning("⚠️ Draw and save a region on the map first")
     
     # Processing buttons
+    st.divider()
+    
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        start_new = st.button("🚀 Start New", type="primary")
+        start_new = st.button(
+            "🚀 Start New", 
+            type="primary", 
+            disabled=st.session_state.processing_in_progress or selected_polygon is None
+        )
     
     with col2:
         has_cache = bool(st.session_state.downloaded_images or st.session_state.month_analysis_results)
-        resume_btn = st.button("🔄 Resume", disabled=not has_cache)
+        resume_btn = st.button(
+            "🔄 Resume", 
+            disabled=not has_cache or st.session_state.processing_in_progress
+        )
     
     with col3:
         has_failed = bool(st.session_state.failed_downloads)
-        retry_btn = st.button("🔁 Retry Failed", disabled=not has_failed)
+        retry_btn = st.button(
+            "🔁 Retry Failed", 
+            disabled=not has_failed or st.session_state.processing_in_progress
+        )
     
+    # Determine if we should process
     should_process = False
     resume_mode = False
     
@@ -1268,35 +1362,95 @@ def main():
         st.session_state.classification_thumbnails = []
         st.session_state.valid_patches_mask = None
         st.session_state.failed_downloads = []
-        # Keep downloaded_images if files exist (will be validated)
+        st.session_state.processing_complete = False
+        
+        # Store processing config
+        st.session_state.processing_config = {
+            'polygon_coords': list(selected_polygon.exterior.coords),
+            'start_date': start.strftime('%Y-%m-%d'),
+            'end_date': end.strftime('%Y-%m-%d'),
+            'cloudy_pct': cloudy_pct,
+            'nodata_pct': nodata_pct
+        }
+        st.session_state.processing_in_progress = True
     
     elif resume_btn:
         should_process = True
         resume_mode = True
+        st.session_state.processing_in_progress = True
+        
+        # Use stored config or create new
+        if st.session_state.processing_config is None:
+            st.session_state.processing_config = {
+                'polygon_coords': list(selected_polygon.exterior.coords),
+                'start_date': start.strftime('%Y-%m-%d'),
+                'end_date': end.strftime('%Y-%m-%d'),
+                'cloudy_pct': cloudy_pct,
+                'nodata_pct': nodata_pct
+            }
     
     elif retry_btn:
         should_process = True
         resume_mode = True
-        # Clear only failed downloads to retry them
         st.session_state.failed_downloads = []
+        st.session_state.processing_in_progress = True
+        
+        # Use stored config or create new
+        if st.session_state.processing_config is None:
+            st.session_state.processing_config = {
+                'polygon_coords': list(selected_polygon.exterior.coords),
+                'start_date': start.strftime('%Y-%m-%d'),
+                'end_date': end.strftime('%Y-%m-%d'),
+                'cloudy_pct': cloudy_pct,
+                'nodata_pct': nodata_pct
+            }
     
+    # Auto-continue if processing was in progress (handles page reruns)
+    elif st.session_state.processing_in_progress and st.session_state.processing_config is not None:
+        should_process = True
+        resume_mode = True
+        st.info("🔄 Auto-continuing processing...")
+    
+    # Execute processing
     if should_process:
-        if not poly:
-            st.error("Select a region!")
+        config = st.session_state.processing_config
+        
+        if config is None:
+            st.error("❌ No processing configuration found!")
+            st.session_state.processing_in_progress = False
             st.stop()
         
-        aoi = ee.Geometry.Polygon([list(poly.exterior.coords)])
+        # Create polygon from stored coords
+        poly = Polygon(config['polygon_coords'])
+        aoi = ee.Geometry.Polygon([config['polygon_coords']])
         
-        thumbs = process_timeseries(
-            aoi, start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'),
-            st.session_state.model, st.session_state.device,
-            cloudy_pct, 10, nodata_pct, resume=resume_mode
-        )
-        
-        if thumbs:
-            st.session_state.classification_thumbnails = thumbs
-            st.session_state.processing_complete = True
+        try:
+            thumbs = process_timeseries(
+                aoi, 
+                config['start_date'], 
+                config['end_date'],
+                st.session_state.model, 
+                st.session_state.device,
+                config['cloudy_pct'], 
+                10, 
+                config['nodata_pct'], 
+                resume=resume_mode
+            )
+            
+            if thumbs:
+                st.session_state.classification_thumbnails = thumbs
+                st.session_state.processing_complete = True
+            
+            # Processing finished
+            st.session_state.processing_in_progress = False
+            
+        except Exception as e:
+            st.error(f"❌ Processing error: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
+            st.session_state.processing_in_progress = False
     
+    # Display Results
     if st.session_state.processing_complete and st.session_state.classification_thumbnails:
         st.divider()
         st.header("📊 Results")
