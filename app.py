@@ -1,6 +1,6 @@
 """
 Sentinel-2 Time Series Building Classification
-VERSION 10 - EXACT JS ALGORITHM
+VERSION 10 - EXACT JS ALGORITHM (FIXED)
 
 Strategy:
 1. Skip month entirely if masked_pixels > 30% (don't attempt gap-fill)
@@ -50,7 +50,7 @@ import streamlit as st
 
 st.set_page_config(
     layout="wide", 
-    page_title="Building Classification v10 - JS Algorithm",
+    page_title="Building Classification v10",
     page_icon="🏗️"
 )
 
@@ -73,7 +73,7 @@ SCENE_CLOUD_THRESHOLD = 10
 CLOUD_PROBABILITY_THRESHOLD = 65
 CDI_THRESHOLD = -0.5
 
-# Pre-filter threshold: Skip month if > 30% masked (don't attempt gap-fill)
+# Pre-filter threshold: Skip month if > 30% masked
 MAX_MASKED_PERCENT_FOR_GAPFILL = 30
 
 # Download settings
@@ -283,10 +283,6 @@ def create_cloud_free_collection(aoi, extended_start_date, extended_end_date):
     """
     
     # JS: var s2SR = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    #       .filterBounds(aoi)
-    #       .filterDate(extendedStartDate, extendedEndDate)
-    #       .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-    #       .select(['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9','B11','B12','SCL']);
     s2_sr = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
              .filterBounds(aoi)
              .filterDate(extended_start_date, extended_end_date)
@@ -294,13 +290,11 @@ def create_cloud_free_collection(aoi, extended_start_date, extended_end_date):
              .select(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12', 'SCL']))
     
     # JS: var s2CloudProb = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
-    #       .filterBounds(aoi)
-    #       .filterDate(extendedStartDate, extendedEndDate);
     s2_cloud_prob = (ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
                     .filterBounds(aoi)
                     .filterDate(extended_start_date, extended_end_date))
     
-    # JS: function indexJoin(collectionA, collectionB, propertyName)
+    # JS: function indexJoin
     def index_join(collection_a, collection_b, property_name):
         joined = ee.ImageCollection(
             ee.Join.saveFirst(property_name).apply(
@@ -314,15 +308,11 @@ def create_cloud_free_collection(aoi, extended_start_date, extended_end_date):
         )
         return joined.map(lambda img: img.addBands(ee.Image(img.get(property_name))))
     
-    # JS: var s2Joined = indexJoin(s2SR, s2CloudProb, 'cloud_probability');
     s2_joined = index_join(s2_sr, s2_cloud_prob, 'cloud_probability')
     
     # JS: function maskCloudAndShadow(img)
     def mask_cloud_and_shadow(img):
-        # JS: var cloudProb = img.select('probability');
         cloud_prob = img.select('probability')
-        
-        # JS: var cdi = ee.Algorithms.Sentinel2.CDI(img);
         cdi = ee.Algorithms.Sentinel2.CDI(img)
         
         # JS: var iscloud = cloudProb.gt(65).and(cdi.lt(-0.5));
@@ -334,240 +324,181 @@ def create_cloud_free_collection(aoi, extended_start_date, extended_end_date):
         # JS: var cloudDilated = iscloud.focal_max({kernel: kernel, iterations: 2});
         cloud_dilated = is_cloud.focal_max(kernel=kernel, iterations=2)
         
-        # JS: var masked = img.updateMask(cloudDilated.not());
         masked = img.updateMask(cloud_dilated.Not())
-        
-        # JS: var scaled = masked.select(spectralBands).multiply(0.0001).clip(aoi);
         scaled = masked.select(SPECTRAL_BANDS).multiply(0.0001).clip(aoi)
         
-        # JS: return scaled.copyProperties(img, ['system:time_start']);
         return scaled.copyProperties(img, ['system:time_start'])
     
-    # JS: var cloudFreeCollection = s2Joined.map(maskCloudAndShadow);
     cloud_free_collection = s2_joined.map(mask_cloud_and_shadow)
     
     return cloud_free_collection
 
 
 # =============================================================================
-# GEE SECTION 4: CREATE MONTHLY COMPOSITES (EXACT JS)
+# GEE SECTION 4: CREATE MONTHLY COMPOSITE
 # =============================================================================
 def create_monthly_composite(cloud_free_collection, aoi, origin, month_index):
     """
-    Create a single monthly composite with frequency map.
-    EXACT translation of JS Section 4.
+    Create a single monthly composite.
+    Uses Python conditionals to avoid ee.Element issues.
     """
-    month_index = ee.Number(month_index)
     origin_date = ee.Date(origin)
+    month_idx = ee.Number(month_index)
     
-    # JS: var monthStart = origin.advance(i, 'month');
-    month_start = origin_date.advance(month_index, 'month')
-    month_end = origin_date.advance(month_index.add(1), 'month')
+    month_start = origin_date.advance(month_idx, 'month')
+    month_end = origin_date.advance(month_idx.add(1), 'month')
+    month_middle = month_start.advance(15, 'day')
+    month_name = month_start.format('YYYY-MM').getInfo()
     
-    # JS: var monthlyImages = collection.filterDate(monthStart, monthEnd);
     monthly_images = cloud_free_collection.filterDate(month_start, month_end)
+    image_count = monthly_images.size().getInfo()
     
-    # JS: var imageCount = monthlyImages.size();
-    image_count = monthly_images.size()
+    if image_count == 0:
+        # No images - return None
+        return {
+            'image': None,
+            'month_index': month_index,
+            'month_name': month_name,
+            'month_start': month_start,
+            'month_end': month_end,
+            'month_middle': month_middle,
+            'image_count': 0,
+            'has_data': False
+        }
     
-    # Empty image template
-    empty_image = (ee.Image.constant(ee.List.repeat(0, len(SPECTRAL_BANDS)))
-                   .rename(SPECTRAL_BANDS)
-                   .toFloat()
-                   .updateMask(ee.Image.constant(0)))
+    # Has images - create frequency map and median composite
+    frequency_map = (monthly_images
+                    .map(lambda img: ee.Image(1).updateMask(img.select('B4').mask()).unmask(0).toInt())
+                    .sum()
+                    .toInt()
+                    .rename('frequency')
+                    .clip(aoi))
     
-    # JS: var frequencyMap = ee.Image(ee.Algorithms.If(...))
-    frequency_map = ee.Image(ee.Algorithms.If(
-        image_count.gt(0),
-        monthly_images.map(lambda img: 
-            ee.Image(1)
-            .updateMask(img.select('B4').mask())
-            .unmask(0)
-            .toInt()
-        ).sum().toInt(),
-        ee.Image.constant(0).toInt().clip(aoi)
-    )).rename('frequency')
-    
-    # JS: var monthlyComposite = ee.Image(ee.Algorithms.If(...))
-    monthly_composite = ee.Image(ee.Algorithms.If(
-        image_count.gt(0),
-        monthly_images.median(),
-        empty_image.clip(aoi)
-    ))
-    
-    # JS: var validityMask = frequencyMap.gt(0).rename('validity_mask');
+    monthly_composite = monthly_images.median().clip(aoi)
     validity_mask = frequency_map.gt(0).rename('validity_mask')
     
-    # JS: var monthMiddle = monthStart.advance(15, 'day');
-    month_middle = month_start.advance(15, 'day')
-    
-    # JS: var monthName = monthStart.format('YYYY-MM');
-    month_name = month_start.format('YYYY-MM')
-    
-    # Build result image
+    # Combine bands
     result_image = (monthly_composite
                    .addBands(frequency_map)
-                   .addBands(validity_mask)
-                   .set('system:time_start', month_start.millis())
-                   .set('system:time_end', month_end.millis())
-                   .set('month_middle', month_middle.millis())
-                   .set('month_index', month_index)
-                   .set('month_name', month_name)
-                   .set('image_count', image_count)
-                   .set('has_data', image_count.gt(0)))
+                   .addBands(validity_mask))
     
     return {
         'image': result_image,
         'month_index': month_index,
+        'month_name': month_name,
         'month_start': month_start,
         'month_end': month_end,
-        'month_middle': month_middle
+        'month_middle': month_middle,
+        'image_count': image_count,
+        'has_data': True
     }
 
 
 # =============================================================================
-# GEE SECTION 7: GAP-FILLING (EXACT JS - M-1, M+1 only)
+# GEE SECTION 7: GAP-FILLING
 # =============================================================================
 def gap_fill_month(monthly_composite_info, cloud_free_collection, aoi, origin):
     """
-    EXACT translation of JS Section 7: gapFillMonthClosest
-    
-    Strategy (from JS):
-    1. Collect cloud-free images from M-1, M+1
-    2. Sort by time distance from middle of current month
-    3. Mosaic: first valid pixel wins (closest in time)
-    4. Fill using unmask()
+    Gap-fill using M-1 and M+1.
+    Sort by time distance, mosaic (first valid pixel wins).
     """
-    
     month_index = monthly_composite_info['month_index']
     current_img = monthly_composite_info['image']
     origin_date = ee.Date(origin)
     
-    # JS: var originalSpectral = currentImg.select(spectralBands);
     original_spectral = current_img.select(SPECTRAL_BANDS)
-    
-    # JS: var frequency = currentImg.select('frequency');
     frequency = current_img.select('frequency')
-    
-    # JS: var validityMask = currentImg.select('validity_mask');
     validity_mask = current_img.select('validity_mask')
     
-    # JS: var gapMask = frequency.eq(0);
     gap_mask = frequency.eq(0)
     
-    # Current month boundaries
     month_start = monthly_composite_info['month_start']
     month_end = monthly_composite_info['month_end']
     month_middle = monthly_composite_info['month_middle']
     month_middle_millis = month_middle.millis()
     
-    # JS: Define search ranges for M-1, M+1
-    # var m1PastStart = origin.advance(monthIndex.subtract(1), 'month');
-    # var m1PastEnd = currentMonthStart;
+    # M-1 range
     m1_past_start = origin_date.advance(ee.Number(month_index).subtract(1), 'month')
     m1_past_end = month_start
     
-    # var m1FutureStart = currentMonthEnd;
-    # var m1FutureEnd = origin.advance(monthIndex.add(2), 'month');
+    # M+1 range
     m1_future_start = month_end
     m1_future_end = origin_date.advance(ee.Number(month_index).add(2), 'month')
     
-    # Empty image template
-    empty_spectral = (ee.Image.constant(ee.List.repeat(0, len(SPECTRAL_BANDS)))
-                     .rename(SPECTRAL_BANDS)
-                     .toFloat()
-                     .updateMask(ee.Image.constant(0))
-                     .clip(aoi))
-    
-    # JS: var m1PastImages = cloudFreeCollection.filterDate(m1PastStart, m1PastEnd);
+    # Collect candidate images
     m1_past_images = cloud_free_collection.filterDate(m1_past_start, m1_past_end)
-    
-    # JS: var m1FutureImages = cloudFreeCollection.filterDate(m1FutureStart, m1FutureEnd);
     m1_future_images = cloud_free_collection.filterDate(m1_future_start, m1_future_end)
-    
-    # JS: var allCandidateImages = m1PastImages.merge(m1FutureImages);
-    # NOTE: Skipping M-2 as requested - only M-1 and M+1
     all_candidate_images = m1_past_images.merge(m1_future_images)
     
-    # JS: Add time distance property to each image
+    candidate_count = all_candidate_images.size().getInfo()
+    
+    if candidate_count == 0:
+        # No candidates - return original with fill_source = 2 for gaps
+        fill_source = (ee.Image.constant(0).clip(aoi).toInt8()
+                      .where(gap_mask, 2)
+                      .rename('fill_source'))
+        
+        new_validity_mask = original_spectral.select('B4').mask().rename('filled_validity_mask')
+        
+        result = (original_spectral
+                 .addBands(frequency)
+                 .addBands(validity_mask)
+                 .addBands(new_validity_mask)
+                 .addBands(fill_source))
+        
+        return result
+    
+    # Add time distance and sort
     def add_time_distance(img):
         img_time = ee.Number(img.get('system:time_start'))
         time_diff = img_time.subtract(month_middle_millis).abs()
         return img.set('time_distance', time_diff)
     
     images_with_distance = all_candidate_images.map(add_time_distance)
-    
-    # JS: var sortedImages = imagesWithDistance.sort('time_distance', true);
     sorted_images = images_with_distance.sort('time_distance', True)
     
-    # JS: var closestMosaic = ee.Image(ee.Algorithms.If(
-    #       sortedImages.size().gt(0),
-    #       sortedImages.mosaic().select(spectralBands),
-    #       emptySpectral
-    #     ));
-    closest_mosaic = ee.Image(ee.Algorithms.If(
-        sorted_images.size().gt(0),
-        sorted_images.mosaic().select(SPECTRAL_BANDS),
-        empty_spectral
-    ))
-    
-    # JS: var hasClosest = closestMosaic.select('B4').mask();
+    # Mosaic: first valid pixel wins
+    closest_mosaic = sorted_images.mosaic().select(SPECTRAL_BANDS)
     has_closest = closest_mosaic.select('B4').mask()
     
-    # JS: var fillFromClosest = gapMask.and(hasClosest);
     fill_from_closest = gap_mask.And(has_closest)
-    
-    # JS: var stillMasked = gapMask.and(hasClosest.not());
     still_masked = gap_mask.And(has_closest.Not())
     
-    # JS: var filledSpectral = originalSpectral.unmask(closestMosaic.updateMask(fillFromClosest));
+    # Fill gaps
     filled_spectral = original_spectral.unmask(closest_mosaic.updateMask(fill_from_closest))
     
-    # JS: var fillSource = ee.Image.constant(0).clip(aoi).toInt8()
-    #       .where(fillFromClosest, 1)
-    #       .where(stillMasked, 2)
-    #       .rename('fill_source');
+    # Fill source: 0 = original, 1 = filled, 2 = still masked
     fill_source = (ee.Image.constant(0).clip(aoi).toInt8()
-                   .where(fill_from_closest, 1)
-                   .where(still_masked, 2)
-                   .rename('fill_source'))
+                  .where(fill_from_closest, 1)
+                  .where(still_masked, 2)
+                  .rename('fill_source'))
     
-    # JS: var newValidityMask = filledSpectral.select('B4').mask().rename('filled_validity_mask');
     new_validity_mask = filled_spectral.select('B4').mask().rename('filled_validity_mask')
     
-    # Build result
     result = (filled_spectral
              .addBands(frequency)
              .addBands(validity_mask)
              .addBands(new_validity_mask)
-             .addBands(fill_source)
-             .set('gap_filled', True)
-             .set('candidate_images', all_candidate_images.size())
-             .copyProperties(current_img, current_img.propertyNames()))
+             .addBands(fill_source))
     
     return result
 
 
 def prepare_complete_month(monthly_composite_info, aoi):
     """
-    EXACT translation of JS: prepareCompleteMonth
-    For months that already have 0 masked pixels.
+    Prepare a month that's already complete (0 masked pixels).
     """
     current_img = monthly_composite_info['image']
     frequency = current_img.select('frequency')
     validity_mask = current_img.select('validity_mask')
     
-    # JS: var fillSource = ee.Image.constant(0).clip(aoi).toInt8().rename('fill_source');
     fill_source = ee.Image.constant(0).clip(aoi).toInt8().rename('fill_source')
     
     result = (current_img.select(SPECTRAL_BANDS)
              .addBands(frequency)
              .addBands(validity_mask)
              .addBands(validity_mask.rename('filled_validity_mask'))
-             .addBands(fill_source)
-             .set('gap_filled', False)
-             .set('candidate_images', 0)
-             .copyProperties(current_img, current_img.propertyNames()))
+             .addBands(fill_source))
     
     return result
 
@@ -577,39 +508,32 @@ def prepare_complete_month(monthly_composite_info, aoi):
 # =============================================================================
 def process_gee_composites(aoi, start_date, end_date, status_callback=None):
     """
-    Main GEE processing following exact JS workflow:
-    
+    Main GEE processing:
     1. Create cloud-free collection
     2. Create monthly composites
-    3. For each month:
-       - If no_data → SKIP
-       - If masked_percent > 30% → SKIP (don't gap-fill)
-       - If masked_percent == 0 → COMPLETE (ready for download)
-       - If 0 < masked_percent <= 30% → GAP-FILL
-         - If 0 masked after → COMPLETE
-         - If still masked → REJECTED
-    4. Return only COMPLETE months for download
+    3. Analyze and gap-fill as needed
+    4. Return complete months
     """
     
     # Calculate number of months
     start_date_ee = ee.Date(start_date)
     end_date_ee = ee.Date(end_date)
     
-    num_months = (end_date_ee.get('year').subtract(start_date_ee.get('year')).multiply(12)
-                  .add(end_date_ee.get('month').subtract(start_date_ee.get('month'))))
-    num_months_val = num_months.getInfo()
+    start_year = start_date_ee.get('year').getInfo()
+    start_month = start_date_ee.get('month').getInfo()
+    end_year = end_date_ee.get('year').getInfo()
+    end_month = end_date_ee.get('month').getInfo()
+    
+    num_months = (end_year - start_year) * 12 + (end_month - start_month)
     
     if status_callback:
-        status_callback(f"Processing {num_months_val} months...")
+        status_callback(f"Processing {num_months} months...")
     
-    # Extended date range for gap-filling (1 month before, 1 month after)
-    # JS: var extendedStartDate = startDateEE.advance(-1, 'month');
+    # Extended date range for gap-filling
     extended_start = start_date_ee.advance(-1, 'month')
     extended_end = end_date_ee.advance(1, 'month')
     
-    # =================================================================
-    # SECTION 2 & 3: Create cloud-free collection
-    # =================================================================
+    # Create cloud-free collection
     if status_callback:
         status_callback("Creating cloud-free collection...")
     
@@ -619,31 +543,22 @@ def process_gee_composites(aoi, start_date, end_date, status_callback=None):
     if status_callback:
         status_callback(f"Found {total_images} cloud-free images")
     
-    # =================================================================
-    # SECTION 4 & 5: Create monthly composites and analyze
-    # =================================================================
-    if status_callback:
-        status_callback("Creating monthly composites...")
-    
+    # Process each month
     month_reports = []
     monthly_composites = []
     
-    for i in range(num_months_val):
+    for i in range(num_months):
         if status_callback:
-            status_callback(f"Analyzing month {i+1}/{num_months_val}...")
+            status_callback(f"Analyzing month {i+1}/{num_months}...")
         
-        # Create composite
         comp_info = create_monthly_composite(cloud_free_collection, aoi, start_date, i)
         monthly_composites.append(comp_info)
         
-        img = comp_info['image']
+        month_name = comp_info['month_name']
+        has_data = comp_info['has_data']
+        image_count = comp_info['image_count']
         
-        # Get properties
-        month_name = img.get('month_name').getInfo()
-        has_data = img.get('has_data').getInfo()
-        image_count = img.get('image_count').getInfo()
-        
-        if not has_data or image_count == 0:
+        if not has_data:
             month_reports.append({
                 'month_index': i,
                 'month_name': month_name,
@@ -659,7 +574,9 @@ def process_gee_composites(aoi, start_date, end_date, status_callback=None):
             continue
         
         # Calculate pixel statistics
+        img = comp_info['image']
         frequency = img.select('frequency')
+        
         pixel_stats = ee.Image.cat([
             frequency.gt(0).rename('valid'),
             frequency.eq(0).rename('masked')
@@ -668,16 +585,10 @@ def process_gee_composites(aoi, start_date, end_date, status_callback=None):
             geometry=aoi,
             scale=10,
             maxPixels=int(1e13)
-        )
+        ).getInfo()
         
-        valid_pixels = ee.Number(pixel_stats.get('valid')).round().getInfo()
-        masked_pixels = ee.Number(pixel_stats.get('masked')).round().getInfo()
-        
-        if valid_pixels is None:
-            valid_pixels = 0
-        if masked_pixels is None:
-            masked_pixels = 0
-            
+        valid_pixels = int(pixel_stats.get('valid', 0) or 0)
+        masked_pixels = int(pixel_stats.get('masked', 0) or 0)
         total_pixels = valid_pixels + masked_pixels
         
         if total_pixels > 0:
@@ -709,16 +620,13 @@ def process_gee_composites(aoi, start_date, end_date, status_callback=None):
             'status_reason': status_reason
         })
     
-    # =================================================================
-    # SECTION 7: Gap-filling
-    # =================================================================
+    # Gap-filling phase
     processed_composites = []
     
     for i, comp_info in enumerate(monthly_composites):
         report = month_reports[i]
         month_name = report['month_name']
         
-        # NO_DATA: Skip entirely
         if report['status'] == 'no_data':
             processed_composites.append({
                 'image': None,
@@ -728,7 +636,6 @@ def process_gee_composites(aoi, start_date, end_date, status_callback=None):
             })
             continue
         
-        # SKIPPED: > 30% masked, don't attempt gap-fill
         if report['status'] == 'skipped':
             processed_composites.append({
                 'image': None,
@@ -738,7 +645,6 @@ def process_gee_composites(aoi, start_date, end_date, status_callback=None):
             })
             continue
         
-        # COMPLETE: 0 masked pixels, ready for download
         if report['status'] == 'complete':
             if status_callback:
                 status_callback(f"{month_name}: Already complete (0 masked)")
@@ -752,28 +658,22 @@ def process_gee_composites(aoi, start_date, end_date, status_callback=None):
             })
             continue
         
-        # NEEDS_GAPFILL: Try gap-filling
         if report['status'] == 'needs_gapfill':
             if status_callback:
                 status_callback(f"Gap-filling {month_name}...")
             
             processed_img = gap_fill_month(comp_info, cloud_free_collection, aoi, start_date)
             
-            # Check if gap-filling was successful (0 masked pixels remaining)
+            # Check if gap-filling was successful
             fill_source = processed_img.select('fill_source')
-            still_masked_count = fill_source.eq(2).reduceRegion(
+            still_masked_stats = fill_source.eq(2).reduceRegion(
                 reducer=ee.Reducer.sum(),
                 geometry=aoi,
                 scale=10,
                 maxPixels=int(1e13)
-            ).get('fill_source')
+            ).getInfo()
             
-            still_masked = ee.Number(ee.Algorithms.If(
-                ee.Algorithms.IsEqual(still_masked_count, None),
-                0,
-                still_masked_count
-            )).round().getInfo()
-            
+            still_masked = int(still_masked_stats.get('fill_source', 0) or 0)
             report['masked_after_gapfill'] = still_masked
             
             if still_masked == 0:
@@ -863,7 +763,7 @@ def download_band_with_retry(image, band, aoi, output_path, scale=10):
 
 
 def download_processed_image(processed_composite, aoi, temp_dir, scale=10, status_placeholder=None):
-    """Download a processed (gap-filled) composite image."""
+    """Download a processed composite image."""
     month_name = processed_composite['month_name']
     image = processed_composite['image']
     
@@ -993,7 +893,6 @@ def classify_image(image_path, model, device, month_name):
             for j in range(n_patches_w):
                 patch = patches[i, j, 0]
                 
-                # Check for valid data (skip empty patches)
                 if np.all(patch == 0) or np.any(np.isnan(patch)):
                     continue
                 
@@ -1027,13 +926,11 @@ def display_month_reports(month_reports):
     
     st.subheader("📊 Month-by-Month Analysis")
     
-    # Categorize
     complete = [r for r in month_reports if r['status'] == 'complete']
     skipped = [r for r in month_reports if r['status'] == 'skipped']
     rejected = [r for r in month_reports if r['status'] == 'rejected']
     no_data = [r for r in month_reports if r['status'] == 'no_data']
     
-    # Summary metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("✅ Complete", len(complete))
@@ -1046,22 +943,17 @@ def display_month_reports(month_reports):
     
     st.divider()
     
-    # Detailed report for each month
     for report in month_reports:
         status = report['status']
         
         if status == 'complete':
             icon = "✅"
-            color = "success"
         elif status == 'skipped':
             icon = "⏭️"
-            color = "warning"
         elif status == 'rejected':
             icon = "❌"
-            color = "error"
         else:
             icon = "📭"
-            color = "info"
         
         with st.expander(f"{icon} {report['month_name']} - {report['status_reason']}"):
             if report['has_data']:
@@ -1080,7 +972,6 @@ def display_month_reports(month_reports):
     
     st.divider()
     
-    # Summary lists
     col1, col2 = st.columns(2)
     
     with col1:
@@ -1116,14 +1007,12 @@ def display_month_reports(month_reports):
 def process_timeseries(aoi, start_date, end_date, model, device, scale=10, resume=False):
     """Main processing pipeline."""
     try:
-        # Setup temp directory
         if st.session_state.current_temp_dir is None or not os.path.exists(st.session_state.current_temp_dir):
             st.session_state.current_temp_dir = tempfile.mkdtemp()
         temp_dir = st.session_state.current_temp_dir
         
         st.info(f"📁 Working directory: {temp_dir}")
         
-        # Check if we can resume
         aoi_hash = hash(str(aoi.coordinates().getInfo()))
         date_range = (start_date, end_date)
         
@@ -1132,9 +1021,7 @@ def process_timeseries(aoi, start_date, end_date, model, device, scale=10, resum
                       st.session_state.cached_date_range == date_range and
                       st.session_state.month_reports)
         
-        # =================================================================
-        # Phase 1: GEE Processing (skip if resuming with cache)
-        # =================================================================
+        # Phase 1: GEE Processing
         if can_resume and st.session_state.month_reports:
             st.header("Phase 1: ⏭️ Using Cached Analysis")
             st.success(f"✅ Found cached analysis for {len(st.session_state.month_reports)} months")
@@ -1152,15 +1039,12 @@ def process_timeseries(aoi, start_date, end_date, model, device, scale=10, resum
             
             progress_status.empty()
             
-            # Cache results
             st.session_state.month_reports = month_reports
             st.session_state.processed_composites = processed_composites
             st.session_state.cached_aoi_hash = aoi_hash
             st.session_state.cached_date_range = date_range
         
-        # =================================================================
         # Phase 2: Display Report
-        # =================================================================
         st.header("Phase 2: Analysis Report")
         complete_months = display_month_reports(month_reports)
         
@@ -1168,14 +1052,10 @@ def process_timeseries(aoi, start_date, end_date, model, device, scale=10, resum
             st.error("❌ No complete months available for download!")
             return []
         
-        # Get complete composites for download
         complete_composites = [pc for pc in processed_composites if pc['status'] == 'complete']
-        
         st.success(f"✅ {len(complete_composites)} months ready for download (0 masked pixels)")
         
-        # =================================================================
         # Phase 3: Download
-        # =================================================================
         st.header("Phase 3: Downloading Images")
         
         downloaded_images = {}
@@ -1188,7 +1068,6 @@ def process_timeseries(aoi, start_date, end_date, model, device, scale=10, resum
             if downloaded_images:
                 st.success(f"✅ Found {len(downloaded_images)} cached downloads")
         
-        # Download remaining
         to_download = [pc for pc in complete_composites if pc['month_name'] not in downloaded_images]
         
         if to_download:
@@ -1213,9 +1092,7 @@ def process_timeseries(aoi, start_date, end_date, model, device, scale=10, resum
         
         st.success(f"✅ Downloaded {len(downloaded_images)} months")
         
-        # =================================================================
         # Phase 4: Classification
-        # =================================================================
         st.header("Phase 4: Building Classification")
         
         thumbnails = []
@@ -1355,7 +1232,6 @@ def main():
     - Dilate: 20m kernel, 2 iterations
     """)
     
-    # Initialize Earth Engine
     ee_initialized, ee_message = initialize_earth_engine()
     if not ee_initialized:
         st.error(ee_message)
@@ -1363,7 +1239,6 @@ def main():
     else:
         st.sidebar.success(ee_message)
     
-    # Model Loading
     st.sidebar.header("🧠 Model")
     model_path = "best_model_version_Unet++_v02_e7.pt"
     
@@ -1384,7 +1259,6 @@ def main():
     else:
         st.sidebar.success("✅ Model loaded")
     
-    # Cache info
     st.sidebar.header("🗂️ Cache")
     if st.session_state.downloaded_images:
         st.sidebar.success(f"📥 {len(st.session_state.downloaded_images)} downloaded")
@@ -1401,7 +1275,6 @@ def main():
         st.session_state.cached_date_range = None
         st.rerun()
     
-    # Map
     st.header("1️⃣ Select Region")
     
     m = folium.Map(location=[35.6892, 51.3890], zoom_start=8)
@@ -1442,7 +1315,6 @@ def main():
                     st.session_state.drawn_polygons.pop(i)
                     st.rerun()
     
-    # Dates
     st.header("2️⃣ Select Dates")
     col1, col2 = st.columns(2)
     with col1:
@@ -1457,7 +1329,6 @@ def main():
     num_months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
     st.info(f"📅 {num_months} months selected")
     
-    # Process
     st.header("3️⃣ Generate")
     
     selected_polygon = None
@@ -1500,7 +1371,6 @@ def main():
             st.session_state.classification_thumbnails = thumbnails
             st.session_state.processing_complete = True
     
-    # Results
     if st.session_state.processing_complete and st.session_state.classification_thumbnails:
         st.divider()
         st.header("📊 Results")
