@@ -23,9 +23,17 @@ GEE SERVER-SIDE:
           * If masked_after > 0%  → "rejected" → SKIP
 
 PYTHON CLIENT-SIDE (after download):
-5. Check patch validity (NaN/zeros) across all downloaded months
-6. Find common valid patches (valid in ALL months)
-7. Classify only valid patches
+5. Validate all downloaded images have SAME dimensions
+6. Check patch validity (NaN/zeros) across all downloaded months
+7. Find common valid patches (valid in ALL months)
+8. Classify only valid patches
+
+GUARANTEES:
+═══════════════════════════════════════════════════════════════════════════════
+✅ All downloaded images have 0% masked pixels (GEE-side guarantee)
+✅ All downloaded images have identical dimensions (validated in Python)
+✅ All classified months have same number of patches (validated in Python)
+✅ Only patches valid across ALL months are classified (cross-month consistency)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -771,27 +779,105 @@ def get_patch_validity_mask(image_path, patch_size=224, nodata_threshold_percent
 
 
 def find_common_valid_patches(downloaded_images, nodata_threshold_percent=5):
-    """Find patches that are valid across ALL months."""
+    """
+    Find patches that are valid across ALL months.
+    
+    IMPORTANT: This function validates that ALL downloaded images have:
+    1. The same dimensions (height, width)
+    2. The same number of patches
+    
+    Returns: (combined_validity_mask, original_size) or (None, None) if validation fails
+    """
     st.info("🔍 Analyzing patch validity across all months...")
     
-    combined_mask = None
-    original_size = None
-    
     month_names = sorted(downloaded_images.keys())
+    
+    if len(month_names) == 0:
+        st.error("❌ No downloaded images to analyze!")
+        return None, None
+    
+    # =========================================================================
+    # STEP 1: Validate all images have the same dimensions
+    # =========================================================================
+    st.write("**Step 1: Validating image dimensions...**")
+    
+    dimensions = {}
+    for month_name in month_names:
+        image_path = downloaded_images[month_name]
+        try:
+            with rasterio.open(image_path) as src:
+                h, w = src.height, src.width
+                bands = src.count
+                dimensions[month_name] = {'height': h, 'width': w, 'bands': bands}
+        except Exception as e:
+            st.error(f"❌ Cannot read {month_name}: {e}")
+            return None, None
+    
+    # Check if all dimensions match
+    first_month = month_names[0]
+    reference_dim = dimensions[first_month]
+    
+    mismatched = []
+    for month_name, dim in dimensions.items():
+        if dim['height'] != reference_dim['height'] or dim['width'] != reference_dim['width']:
+            mismatched.append(f"{month_name}: {dim['height']}x{dim['width']}")
+    
+    if mismatched:
+        st.error(f"❌ **DIMENSION MISMATCH DETECTED!**")
+        st.error(f"Reference ({first_month}): {reference_dim['height']}x{reference_dim['width']}")
+        st.error(f"Mismatched: {', '.join(mismatched)}")
+        st.warning("All months must have identical image dimensions for consistent patch analysis.")
+        return None, None
+    
+    st.success(f"✅ All {len(month_names)} images have same dimensions: {reference_dim['height']}x{reference_dim['width']} ({reference_dim['bands']} bands)")
+    
+    # =========================================================================
+    # STEP 2: Calculate patch grid dimensions
+    # =========================================================================
+    h, w = reference_dim['height'], reference_dim['width']
+    n_patches_h = int(np.ceil(h / PATCH_SIZE))
+    n_patches_w = int(np.ceil(w / PATCH_SIZE))
+    total_patches = n_patches_h * n_patches_w
+    
+    st.write(f"**Step 2: Patch grid**: {n_patches_h} x {n_patches_w} = **{total_patches} patches** per image")
+    
+    # =========================================================================
+    # STEP 3: Build combined validity mask
+    # =========================================================================
+    st.write("**Step 3: Checking patch validity across all months...**")
+    
+    combined_mask = None
+    original_size = (h, w)
+    
     progress_bar = st.progress(0)
+    validity_report = []
     
     for idx, month_name in enumerate(month_names):
         image_path = downloaded_images[month_name]
-        validity_mask, orig_size, _ = get_patch_validity_mask(
+        validity_mask, orig_size, grid_size = get_patch_validity_mask(
             image_path, PATCH_SIZE, nodata_threshold_percent
         )
         
         if validity_mask is None:
+            st.warning(f"⚠️ Could not analyze {month_name}")
+            progress_bar.progress((idx + 1) / len(month_names))
             continue
+        
+        # Verify grid size matches expected
+        if validity_mask.shape != (n_patches_h, n_patches_w):
+            st.error(f"❌ {month_name}: Patch grid mismatch! Expected {(n_patches_h, n_patches_w)}, got {validity_mask.shape}")
+            return None, None
+        
+        valid_count = np.sum(validity_mask)
+        validity_report.append({
+            'month': month_name,
+            'valid': valid_count,
+            'total': total_patches,
+            'percent': 100 * valid_count / total_patches
+        })
         
         if combined_mask is None:
             combined_mask = validity_mask.copy()
-            original_size = orig_size
         else:
             combined_mask = combined_mask & validity_mask
         
@@ -799,20 +885,38 @@ def find_common_valid_patches(downloaded_images, nodata_threshold_percent=5):
     
     progress_bar.empty()
     
-    if combined_mask is not None:
-        final_valid = np.sum(combined_mask)
-        total = combined_mask.size
-        st.success(f"✅ **{final_valid}/{total}** patches valid across ALL months ({100*final_valid/total:.1f}%)")
-        
-        if final_valid == 0:
-            st.error("❌ No patches valid across all months!")
-            return None, None
+    # =========================================================================
+    # STEP 4: Summary
+    # =========================================================================
+    if combined_mask is None:
+        st.error("❌ Could not create validity mask!")
+        return None, None
+    
+    # Show per-month validity
+    with st.expander("📊 Per-Month Validity Report", expanded=False):
+        for report in validity_report:
+            st.write(f"  {report['month']}: {report['valid']}/{report['total']} patches valid ({report['percent']:.1f}%)")
+    
+    final_valid = np.sum(combined_mask)
+    
+    st.divider()
+    st.success(f"✅ **{final_valid}/{total_patches}** patches valid across ALL {len(month_names)} months ({100*final_valid/total_patches:.1f}%)")
+    
+    if final_valid == 0:
+        st.error("❌ No patches are valid across all months!")
+        st.warning("Try: selecting a different region, different time period, or increasing nodata threshold")
+        return None, None
     
     return combined_mask, original_size
 
 
 def classify_image_with_mask(image_path, model, device, month_name, valid_mask, original_size):
-    """Classify an image, only processing valid patches."""
+    """
+    Classify an image, only processing valid patches.
+    
+    IMPORTANT: Validates that image dimensions match expected original_size
+    and that patch grid matches valid_mask shape.
+    """
     try:
         with rasterio.open(image_path) as src:
             img_data = src.read()
@@ -820,8 +924,25 @@ def classify_image_with_mask(image_path, model, device, month_name, valid_mask, 
         img_for_patching = np.moveaxis(img_data, 0, -1)
         
         h, w, c = img_for_patching.shape
+        
+        # VALIDATION: Check image dimensions match expected size
+        if original_size is not None:
+            expected_h, expected_w = original_size
+            if h != expected_h or w != expected_w:
+                st.error(f"❌ {month_name}: Dimension mismatch! Expected {expected_h}x{expected_w}, got {h}x{w}")
+                return None, 0
+        
         new_h = int(np.ceil(h / PATCH_SIZE) * PATCH_SIZE)
         new_w = int(np.ceil(w / PATCH_SIZE) * PATCH_SIZE)
+        
+        # Calculate expected patch grid
+        n_patches_h = new_h // PATCH_SIZE
+        n_patches_w = new_w // PATCH_SIZE
+        
+        # VALIDATION: Check patch grid matches valid_mask
+        if valid_mask.shape != (n_patches_h, n_patches_w):
+            st.error(f"❌ {month_name}: Patch grid mismatch! Mask is {valid_mask.shape}, image needs {(n_patches_h, n_patches_w)}")
+            return None, 0
         
         if h != new_h or w != new_w:
             padded_img = np.zeros((new_h, new_w, c), dtype=img_for_patching.dtype)
@@ -925,9 +1046,31 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         downloaded_images = {}
         month_statuses = {}
         
-        # Check existing cached downloads first
+        # Prepare month info list FIRST - so we know which months are in current range
+        month_infos = []
+        current_range_months = set()
+        for month_index in range(total_months):
+            # Proper month calculation: add months to start date
+            year = start_dt.year + (start_dt.month - 1 + month_index) // 12
+            month = (start_dt.month - 1 + month_index) % 12 + 1
+            month_name = f"{year}-{month:02d}"
+            month_infos.append({
+                'month_name': month_name,
+                'month_index': month_index,
+                'origin': start_date
+            })
+            current_range_months.add(month_name)
+        
+        # Show expected months for clarity
+        st.info(f"📅 Expected months: {month_infos[0]['month_name']} to {month_infos[-1]['month_name']} ({len(month_infos)} months, end date is EXCLUSIVE)")
+        
+        # Check existing cached downloads (ONLY for months in current range)
         if resume and st.session_state.downloaded_images:
             for month_name, path in st.session_state.downloaded_images.items():
+                # Only consider months in current date range
+                if month_name not in current_range_months:
+                    continue
+                    
                 if os.path.exists(path):
                     is_valid, _ = validate_geotiff_file(path, len(SPECTRAL_BANDS))
                     if is_valid:
@@ -939,26 +1082,38 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                 for mn in sorted(downloaded_images.keys()):
                     st.write(f"🟢 **{mn}**: complete (cached)")
         
-        # Prepare month info list
-        month_infos = []
-        for month_index in range(total_months):
-            current_date = start_dt + datetime.timedelta(days=month_index * 30)
-            month_name = f"{current_date.year}-{current_date.month:02d}"
-            month_infos.append({
-                'month_name': month_name,
-                'month_index': month_index,
-                'origin': start_date
-            })
+        # Restore previous month statuses (ONLY for months in current range that aren't downloaded)
+        if resume and st.session_state.month_analysis_results:
+            for month_name, status_info in st.session_state.month_analysis_results.items():
+                # Only consider months in current date range
+                if month_name not in current_range_months:
+                    continue
+                    
+                if month_name not in month_statuses:
+                    month_statuses[month_name] = status_info
+                    status = status_info.get('status', 'unknown')
+                    message = status_info.get('message', '')
+                    icon = {"no_data": "⚫", "skipped": "🟡", "complete": "🟢", "rejected": "🔴"}.get(status, "❓")
+                    st.write(f"{icon} **{month_name}**: {status} (cached) - {message}")
         
-        # Process remaining months
-        months_to_process = [m for m in month_infos if m['month_name'] not in downloaded_images]
+        # Process remaining months (not in downloaded_images AND not already processed with status)
+        months_to_process = [m for m in month_infos 
+                            if m['month_name'] not in downloaded_images 
+                            and m['month_name'] not in month_statuses]
         
         if months_to_process:
+            st.info(f"📥 {len(months_to_process)} months to process: {', '.join([m['month_name'] for m in months_to_process])}")
             progress_bar = st.progress(0)
             status_text = st.empty()
             
             for idx, month_info in enumerate(months_to_process):
                 month_name = month_info['month_name']
+                
+                # Safeguard: skip if already processed (shouldn't happen, but just in case)
+                if month_name in month_statuses:
+                    st.warning(f"⚠️ {month_name} already processed, skipping...")
+                    progress_bar.progress((idx + 1) / len(months_to_process))
+                    continue
                 
                 # Download with v06 cloud masking + gap-filling (all in one function)
                 path, status, message = download_monthly_image_v06(
@@ -970,7 +1125,9 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                     status_placeholder=status_text
                 )
                 
+                # Update both local and session state immediately
                 month_statuses[month_name] = {'status': status, 'message': message}
+                st.session_state.month_analysis_results[month_name] = {'status': status, 'message': message}
                 
                 icon = {"no_data": "⚫", "skipped": "🟡", "complete": "🟢", "rejected": "🔴"}.get(status, "❓")
                 st.write(f"{icon} **{month_name}**: {status} - {message}")
@@ -1113,7 +1270,15 @@ def display_thumbnails(thumbnails):
 # =============================================================================
 def main():
     st.title("🏗️ Building Classification v06")
-      
+    st.markdown("""
+    | Status | Condition | Download? |
+    |--------|-----------|-----------|
+    | `no_data` | No images | ❌ |
+    | `skipped` | masked > 30% | ❌ |
+    | `complete` | masked == 0% | ✅ |
+    | `rejected` | masked > 0% after gap-fill | ❌ |
+    """)
+    
     ee_ok, ee_msg = initialize_earth_engine()
     if not ee_ok:
         st.error(ee_msg)
@@ -1148,7 +1313,7 @@ def main():
         disabled=st.session_state.processing_in_progress
     )
     nodata_pct = st.sidebar.slider(
-        "Patch Nodata % (Python)", 0, 50, 5, 1,
+        "Patch Nodata % (Python)", 1, 50, 5, 1,
         help="""AFTER download: Each 224x224 patch is checked for zeros/NaN.
         If a patch has more than this % of zeros in ANY month, 
         that patch is excluded from classification in ALL months.
@@ -1264,15 +1429,23 @@ def main():
     # Date
     st.header("2️⃣ Time Period")
     c1, c2 = st.columns(2)
-    start = c1.date_input("Start", value=date(2024, 1, 1), disabled=st.session_state.processing_in_progress)
-    end = c2.date_input("End", value=date(2025, 1, 1), disabled=st.session_state.processing_in_progress)
+    start = c1.date_input("Start (inclusive)", value=date(2024, 1, 1), disabled=st.session_state.processing_in_progress)
+    end = c2.date_input("End (exclusive)", value=date(2025, 1, 1), disabled=st.session_state.processing_in_progress,
+                        help="This month is NOT included. E.g., End=2024-06-01 means last processed month is May 2024")
     
     if start >= end:
         st.error("Invalid dates")
         st.stop()
     
     months = (end.year - start.year) * 12 + (end.month - start.month)
-    st.info(f"📅 {months} months")
+    
+    # Calculate first and last month names
+    first_month = f"{start.year}-{start.month:02d}"
+    last_year = start.year + (start.month - 1 + months - 1) // 12
+    last_month_num = (start.month - 1 + months - 1) % 12 + 1
+    last_month = f"{last_year}-{last_month_num:02d}"
+    
+    st.info(f"📅 **{months} months**: {first_month} → {last_month} (end date {end.strftime('%Y-%m-%d')} is excluded)")
     
     # Process
     st.header("3️⃣ Process")
