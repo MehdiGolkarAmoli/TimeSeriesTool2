@@ -1,4 +1,3 @@
-
 """
 Sentinel-2 Time Series Building Classification
 VERSION 06 - GEE Cloud Masking + Gap-Filling + Python Patch Validation
@@ -126,6 +125,19 @@ if 'downloaded_images' not in st.session_state:
     st.session_state.downloaded_images = {}
 if 'valid_patches_mask' not in st.session_state:
     st.session_state.valid_patches_mask = None
+# NEW: For resume capability
+if 'month_analysis_results' not in st.session_state:
+    st.session_state.month_analysis_results = {}
+if 'failed_downloads' not in st.session_state:
+    st.session_state.failed_downloads = []
+if 'analysis_complete' not in st.session_state:
+    st.session_state.analysis_complete = False
+if 'download_complete' not in st.session_state:
+    st.session_state.download_complete = False
+if 'cloud_free_collection' not in st.session_state:
+    st.session_state.cloud_free_collection = None
+if 'processing_params' not in st.session_state:
+    st.session_state.processing_params = None
 
 
 # =============================================================================
@@ -303,30 +315,37 @@ def create_cloud_free_collection(aoi, extended_start, extended_end, cloudy_pixel
                      .filterBounds(aoi)
                      .filterDate(extended_start, extended_end))
     
-    # Join collections (indexJoin)
+    # Join collections (indexJoin) - matching JS exactly
     join_filter = ee.Filter.equals(leftField='system:index', rightField='system:index')
     joined = ee.Join.saveFirst('cloud_probability').apply(
         primary=s2_sr, secondary=s2_cloud_prob, condition=join_filter
     )
     
-    def add_cloud_band(img):
-        return img.addBands(ee.Image(img.get('cloud_probability')))
+    # Convert joined FeatureCollection to ImageCollection and add cloud band
+    def add_cloud_band(feature):
+        # Cast feature to image
+        img = ee.Image(feature)
+        cloud_prob_img = ee.Image(img.get('cloud_probability'))
+        return img.addBands(cloud_prob_img)
     
     s2_joined = ee.ImageCollection(joined.map(add_cloud_band))
     
-    # Apply cloud masking (maskCloudAndShadow)
+    # Apply cloud masking (maskCloudAndShadow) - matching JS exactly
     def mask_cloud_and_shadow(img):
+        # Get cloud probability band
         cloud_prob = img.select('probability')
+        
+        # Calculate CDI (Cloud Displacement Index)
         cdi = ee.Algorithms.Sentinel2.CDI(img)
         
         # Cloud mask: prob > 65 AND cdi < -0.5
         is_cloud = cloud_prob.gt(CLOUD_PROB_THRESHOLD).And(cdi.lt(CDI_THRESHOLD))
         
-        # Dilate with 20m kernel
+        # Dilate with 20m kernel, 2 iterations
         kernel = ee.Kernel.circle(radius=20, units='meters')
         cloud_dilated = is_cloud.focal_max(kernel=kernel, iterations=2)
         
-        # Mask and scale
+        # Mask clouds and scale
         masked = img.updateMask(cloud_dilated.Not())
         scaled = masked.select(SPECTRAL_BANDS).multiply(0.0001).clip(aoi)
         
@@ -851,11 +870,12 @@ def generate_thumbnails(image_path, classification_mask, month_name, max_size=25
 
 
 # =============================================================================
-# MAIN PROCESSING PIPELINE
+# MAIN PROCESSING PIPELINE WITH RESUME CAPABILITY
 # =============================================================================
 def process_timeseries(aoi, start_date, end_date, model, device,
-                       cloudy_pixel_percentage=10, scale=10, nodata_threshold_percent=5):
-    """Main processing pipeline."""
+                       cloudy_pixel_percentage=10, scale=10, nodata_threshold_percent=5,
+                       resume=False):
+    """Main processing pipeline with resume capability."""
     try:
         if st.session_state.current_temp_dir is None or not os.path.exists(st.session_state.current_temp_dir):
             st.session_state.current_temp_dir = tempfile.mkdtemp()
@@ -865,11 +885,27 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         end_dt = datetime.datetime.strptime(end_date, '%Y-%m-%d')
         total_months = (end_dt.year - start_dt.year) * 12 + (end_dt.month - start_dt.month)
         
-        st.info(f"📅 Processing {total_months} months...")
+        st.info(f"📅 Processing {total_months} months | 📁 {temp_dir}")
         
         # Extended date range (M-1 to M+1)
         extended_start = (start_dt - datetime.timedelta(days=31)).strftime('%Y-%m-%d')
         extended_end = (end_dt + datetime.timedelta(days=31)).strftime('%Y-%m-%d')
+        
+        # Check if params changed (invalidate cache if so)
+        current_params = {
+            'start_date': start_date,
+            'end_date': end_date,
+            'cloudy_pct': cloudy_pixel_percentage,
+            'aoi_bounds': aoi.bounds().getInfo()
+        }
+        
+        if st.session_state.processing_params != current_params:
+            # Parameters changed, reset everything
+            st.session_state.month_analysis_results = {}
+            st.session_state.analysis_complete = False
+            st.session_state.download_complete = False
+            st.session_state.processing_params = current_params
+            resume = False
         
         # =====================================================================
         # PHASE 1: Create cloud-free collection
@@ -882,41 +918,59 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         )
         
         # =====================================================================
-        # PHASE 2: Analyze each month
+        # PHASE 2: Analyze each month (with cache)
         # =====================================================================
         st.header("Phase 2: Analyze & Gap-Fill")
         
         month_results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
         
-        for month_index in range(total_months):
-            current_date = start_dt + datetime.timedelta(days=month_index * 30)
-            month_name = f"{current_date.year}-{current_date.month:02d}"
+        if resume and st.session_state.analysis_complete and st.session_state.month_analysis_results:
+            st.info(f"🔄 Using cached analysis for {len(st.session_state.month_analysis_results)} months")
+            month_results = list(st.session_state.month_analysis_results.values())
+        else:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
-            status_text.text(f"🔍 {month_name} ({month_index+1}/{total_months})...")
-            
-            try:
-                result = analyze_and_process_month(
-                    aoi, cloud_free_collection, start_date, month_index, total_months
-                )
-                month_results.append(result)
+            for month_index in range(total_months):
+                current_date = start_dt + datetime.timedelta(days=month_index * 30)
+                month_name = f"{current_date.year}-{current_date.month:02d}"
                 
-                icon = {"no_data": "⚫", "skipped": "🟡", "complete": "🟢", "rejected": "🔴"}.get(result['status'], "❓")
-                gap_info = f" [gap-filled]" if result.get('gap_filled') else ""
-                st.write(f"{icon} **{result['month_name']}**: {result['status']}{gap_info} - {result['message']}")
+                # Check cache
+                if resume and month_name in st.session_state.month_analysis_results:
+                    result = st.session_state.month_analysis_results[month_name]
+                    month_results.append(result)
+                    progress_bar.progress((month_index + 1) / total_months)
+                    continue
                 
-            except Exception as e:
-                st.error(f"❌ {month_name}: {str(e)}")
-                month_results.append({
-                    'status': STATUS_NO_DATA, 'month_name': month_name,
-                    'month_index': month_index, 'message': str(e)
-                })
+                status_text.text(f"🔍 {month_name} ({month_index+1}/{total_months})...")
+                
+                try:
+                    result = analyze_and_process_month(
+                        aoi, cloud_free_collection, start_date, month_index, total_months
+                    )
+                    month_results.append(result)
+                    
+                    # Cache result
+                    st.session_state.month_analysis_results[month_name] = result
+                    
+                    icon = {"no_data": "⚫", "skipped": "🟡", "complete": "🟢", "rejected": "🔴"}.get(result['status'], "❓")
+                    gap_info = f" [gap-filled]" if result.get('gap_filled') else ""
+                    st.write(f"{icon} **{result['month_name']}**: {result['status']}{gap_info} - {result['message']}")
+                    
+                except Exception as e:
+                    st.error(f"❌ {month_name}: {str(e)}")
+                    error_result = {
+                        'status': STATUS_NO_DATA, 'month_name': month_name,
+                        'month_index': month_index, 'message': str(e), 'composite': None
+                    }
+                    month_results.append(error_result)
+                    st.session_state.month_analysis_results[month_name] = error_result
+                
+                progress_bar.progress((month_index + 1) / total_months)
             
-            progress_bar.progress((month_index + 1) / total_months)
-        
-        progress_bar.empty()
-        status_text.empty()
+            progress_bar.empty()
+            status_text.empty()
+            st.session_state.analysis_complete = True
         
         # Summary
         st.divider()
@@ -935,49 +989,97 @@ def process_timeseries(aoi, start_date, end_date, model, device,
             st.error("❌ No complete months!")
             return []
         
+        st.success(f"✅ {len(complete_months)} months ready for download")
+        
         # =====================================================================
-        # PHASE 3: Download
+        # PHASE 3: Download (with cache and resume)
         # =====================================================================
         st.header("Phase 3: Download")
         
         downloaded_images = {}
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        failed_downloads = []
         
-        for idx, result in enumerate(complete_months):
-            month_name = result['month_name']
-            output_file = os.path.join(temp_dir, f"sentinel2_{month_name}.tif")
-            
-            # Check cache
-            if month_name in st.session_state.downloaded_images:
-                cached = st.session_state.downloaded_images[month_name]
-                if os.path.exists(cached):
-                    is_valid, _ = validate_geotiff_file(cached, len(SPECTRAL_BANDS))
+        # First, check existing cached downloads
+        if resume:
+            for month_name, path in st.session_state.downloaded_images.items():
+                if os.path.exists(path):
+                    is_valid, _ = validate_geotiff_file(path, len(SPECTRAL_BANDS))
                     if is_valid:
-                        downloaded_images[month_name] = cached
-                        progress_bar.progress((idx + 1) / len(complete_months))
-                        continue
+                        downloaded_images[month_name] = path
             
-            status_text.text(f"📥 {month_name} ({idx+1}/{len(complete_months)})...")
-            
-            path = download_composite(
-                result['composite'].select(SPECTRAL_BANDS), aoi, output_file,
-                month_name, scale, status_text
-            )
-            
-            if path:
-                downloaded_images[month_name] = path
-                st.session_state.downloaded_images[month_name] = path
-            
-            progress_bar.progress((idx + 1) / len(complete_months))
+            if downloaded_images:
+                st.info(f"🔄 Found {len(downloaded_images)} cached downloads")
         
-        progress_bar.empty()
-        status_text.empty()
+        # Download remaining
+        months_to_download = [r for r in complete_months if r['month_name'] not in downloaded_images]
+        
+        if months_to_download:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, result in enumerate(months_to_download):
+                month_name = result['month_name']
+                output_file = os.path.join(temp_dir, f"sentinel2_{month_name}.tif")
+                
+                status_text.text(f"📥 {month_name} ({idx+1}/{len(months_to_download)})...")
+                
+                # Get composite from cache or result
+                composite = result.get('composite')
+                if composite is None:
+                    # Try to get from cached analysis
+                    cached_result = st.session_state.month_analysis_results.get(month_name)
+                    if cached_result:
+                        composite = cached_result.get('composite')
+                
+                if composite is None:
+                    st.warning(f"⚠️ {month_name}: No composite available, re-analyzing...")
+                    # Re-analyze this month
+                    try:
+                        month_idx = result.get('month_index', idx)
+                        new_result = analyze_and_process_month(
+                            aoi, cloud_free_collection, start_date, month_idx, total_months
+                        )
+                        if new_result['status'] == STATUS_COMPLETE:
+                            composite = new_result['composite']
+                            st.session_state.month_analysis_results[month_name] = new_result
+                    except Exception as e:
+                        st.error(f"❌ Re-analysis failed: {e}")
+                        failed_downloads.append(month_name)
+                        continue
+                
+                if composite is None:
+                    failed_downloads.append(month_name)
+                    continue
+                
+                path = download_composite(
+                    composite.select(SPECTRAL_BANDS), aoi, output_file,
+                    month_name, scale, status_text
+                )
+                
+                if path:
+                    downloaded_images[month_name] = path
+                    st.session_state.downloaded_images[month_name] = path
+                else:
+                    failed_downloads.append(month_name)
+                    st.warning(f"⚠️ {month_name}: Download failed")
+                
+                progress_bar.progress((idx + 1) / len(months_to_download))
+            
+            progress_bar.empty()
+            status_text.empty()
+        
+        # Update failed downloads in session state
+        st.session_state.failed_downloads = failed_downloads
+        
+        if failed_downloads:
+            st.warning(f"⚠️ Failed: {', '.join(failed_downloads)}")
         
         st.success(f"✅ Downloaded {len(downloaded_images)}/{len(complete_months)}")
         
         if not downloaded_images:
             return []
+        
+        st.session_state.download_complete = True
         
         # =====================================================================
         # PHASE 4: Patch validity
@@ -998,7 +1100,7 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         plt.close()
         
         # =====================================================================
-        # PHASE 5: Classify
+        # PHASE 5: Classify (with cache)
         # =====================================================================
         st.header("Phase 5: Classification")
         
@@ -1008,6 +1110,7 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         status_text = st.empty()
         
         for idx, month_name in enumerate(month_names):
+            # Check cache
             if month_name in st.session_state.processed_months:
                 thumbnails.append(st.session_state.processed_months[month_name])
                 progress_bar.progress((idx + 1) / len(month_names))
@@ -1023,10 +1126,10 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                 thumb = generate_thumbnails(downloaded_images[month_name], mask, month_name)
                 if thumb:
                     thumb['valid_patches'] = valid_count
-                    for r in complete_months:
-                        if r['month_name'] == month_name:
-                            thumb['gap_filled'] = r.get('gap_filled', False)
-                            break
+                    # Add gap-fill info
+                    analysis_result = st.session_state.month_analysis_results.get(month_name, {})
+                    thumb['gap_filled'] = analysis_result.get('gap_filled', False)
+                    
                     thumbnails.append(thumb)
                     st.session_state.processed_months[month_name] = thumb
             
@@ -1125,19 +1228,39 @@ def main():
     cloudy_pct = st.sidebar.slider("Max Cloud %", 0, 50, 10, 5)
     nodata_pct = st.sidebar.slider("Patch Nodata %", 1, 50, 5, 1)
     
-    # Cache
-    st.sidebar.header("🗂️ Cache")
-    if st.session_state.downloaded_images:
-        st.sidebar.success(f"📥 {len(st.session_state.downloaded_images)} images")
-    if st.session_state.processed_months:
-        st.sidebar.success(f"🧠 {len(st.session_state.processed_months)} classified")
+    # Cache Status
+    st.sidebar.header("🗂️ Cache Status")
     
-    if st.sidebar.button("🗑️ Clear"):
+    cache_info = []
+    if st.session_state.month_analysis_results:
+        cache_info.append(f"📊 {len(st.session_state.month_analysis_results)} months analyzed")
+    if st.session_state.downloaded_images:
+        cache_info.append(f"📥 {len(st.session_state.downloaded_images)} images downloaded")
+    if st.session_state.processed_months:
+        cache_info.append(f"🧠 {len(st.session_state.processed_months)} months classified")
+    
+    if cache_info:
+        for info in cache_info:
+            st.sidebar.success(info)
+    else:
+        st.sidebar.info("No cached data")
+    
+    if st.session_state.failed_downloads:
+        st.sidebar.warning(f"❌ Failed: {', '.join(st.session_state.failed_downloads)}")
+    
+    if st.sidebar.button("🗑️ Clear All Cache"):
         for key in ['processed_months', 'downloaded_images', 'classification_thumbnails', 
-                    'valid_patches_mask', 'current_temp_dir']:
-            st.session_state[key] = {} if 'months' in key or 'images' in key else None
+                    'valid_patches_mask', 'current_temp_dir', 'month_analysis_results',
+                    'failed_downloads', 'analysis_complete', 'download_complete',
+                    'processing_params']:
+            if key in st.session_state:
+                if isinstance(st.session_state[key], dict):
+                    st.session_state[key] = {}
+                elif isinstance(st.session_state[key], list):
+                    st.session_state[key] = []
+                else:
+                    st.session_state[key] = None
         st.session_state.processing_complete = False
-        st.session_state.classification_thumbnails = []
         st.rerun()
     
     # Region Selection
@@ -1190,7 +1313,47 @@ def main():
     
     poly = st.session_state.drawn_polygons[0] if st.session_state.drawn_polygons else st.session_state.last_drawn_polygon
     
-    if st.button("🚀 Start", type="primary"):
+    # Processing buttons
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        start_new = st.button("🚀 Start New", type="primary")
+    
+    with col2:
+        has_cache = bool(st.session_state.downloaded_images or st.session_state.month_analysis_results)
+        resume_btn = st.button("🔄 Resume", disabled=not has_cache)
+    
+    with col3:
+        has_failed = bool(st.session_state.failed_downloads)
+        retry_btn = st.button("🔁 Retry Failed", disabled=not has_failed)
+    
+    should_process = False
+    resume_mode = False
+    
+    if start_new:
+        should_process = True
+        resume_mode = False
+        # Clear cache for fresh start
+        st.session_state.month_analysis_results = {}
+        st.session_state.analysis_complete = False
+        st.session_state.download_complete = False
+        st.session_state.processed_months = {}
+        st.session_state.classification_thumbnails = []
+        st.session_state.valid_patches_mask = None
+        st.session_state.failed_downloads = []
+        # Keep downloaded_images if files exist (will be validated)
+    
+    elif resume_btn:
+        should_process = True
+        resume_mode = True
+    
+    elif retry_btn:
+        should_process = True
+        resume_mode = True
+        # Clear only failed downloads to retry them
+        st.session_state.failed_downloads = []
+    
+    if should_process:
         if not poly:
             st.error("Select a region!")
             st.stop()
@@ -1200,7 +1363,7 @@ def main():
         thumbs = process_timeseries(
             aoi, start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'),
             st.session_state.model, st.session_state.device,
-            cloudy_pct, 10, nodata_pct
+            cloudy_pct, 10, nodata_pct, resume=resume_mode
         )
         
         if thumbs:
