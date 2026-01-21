@@ -1058,16 +1058,26 @@ def process_timeseries(aoi, start_date, end_date, model, device, scale=10, resum
         # Phase 3: Download
         st.header("Phase 3: Downloading Images")
         
+        # Check if there are any complete months to download
+        if not complete_composites:
+            st.error("❌ No complete months available for download!")
+            st.warning("All months either have >30% masked pixels or still have masked pixels after gap-fill.")
+            return []
+        
         downloaded_images = {}
+        
+        # Restore from cache if resuming
         if resume and st.session_state.downloaded_images:
             for month_name, path in st.session_state.downloaded_images.items():
                 if os.path.exists(path):
                     is_valid, _ = validate_geotiff_file(path, expected_bands=len(SPECTRAL_BANDS))
                     if is_valid:
                         downloaded_images[month_name] = path
+                        st.write(f"✅ {month_name}: Found in cache")
             if downloaded_images:
-                st.success(f"✅ Found {len(downloaded_images)} cached downloads")
+                st.success(f"✅ Restored {len(downloaded_images)} cached downloads")
         
+        # Find months that need downloading
         to_download = [pc for pc in complete_composites if pc['month_name'] not in downloaded_images]
         
         if to_download:
@@ -1077,32 +1087,52 @@ def process_timeseries(aoi, start_date, end_date, model, device, scale=10, resum
             status_text = st.empty()
             
             for idx, pc in enumerate(to_download):
+                month_name = pc['month_name']
                 output_file = download_processed_image(pc, aoi, temp_dir, scale, status_text)
                 
                 if output_file:
-                    downloaded_images[pc['month_name']] = output_file
+                    downloaded_images[month_name] = output_file
                     st.session_state.downloaded_images = downloaded_images.copy()
+                    st.write(f"✅ {month_name}: Downloaded successfully")
+                else:
+                    st.warning(f"⚠️ {month_name}: Download failed!")
                 
                 progress_bar.progress((idx + 1) / len(to_download))
             
             progress_bar.empty()
             status_text.empty()
         else:
-            st.success("All months already downloaded!")
+            st.info("All complete months already in cache!")
         
-        st.success(f"✅ Downloaded {len(downloaded_images)} months")
+        # Final check
+        if downloaded_images:
+            st.success(f"✅ Total: {len(downloaded_images)} months ready for classification")
+        else:
+            st.error("❌ No images were downloaded successfully!")
+            return []
         
         # Phase 4: Classification
         st.header("Phase 4: Building Classification")
         
+        # Check if we have any images to classify
+        if not downloaded_images:
+            st.error("❌ No images were downloaded! Cannot classify.")
+            return []
+        
         thumbnails = []
-        existing = {t['month_name']: t for t in st.session_state.classification_thumbnails} if resume else {}
+        existing = {}
         
+        # Check for cached classifications (only if resuming)
+        if resume and st.session_state.classification_thumbnails:
+            for t in st.session_state.classification_thumbnails:
+                if t['month_name'] in downloaded_images:
+                    existing[t['month_name']] = t
+            if existing:
+                thumbnails = list(existing.values())
+                st.success(f"✅ Found {len(existing)} cached classifications")
+        
+        # Find months that need classification
         to_classify = [m for m in sorted(downloaded_images.keys()) if m not in existing]
-        
-        if existing:
-            thumbnails = list(existing.values())
-            st.success(f"✅ Found {len(existing)} cached classifications")
         
         if to_classify:
             st.info(f"🧠 Classifying {len(to_classify)} months...")
@@ -1133,19 +1163,35 @@ def process_timeseries(aoi, start_date, end_date, model, device, scale=10, resum
                         'total_pixels': h * w
                     }
                     thumbnails.append(thumb)
+                    
+                    # Save progress after each classification
                     st.session_state.classification_thumbnails = thumbnails.copy()
+                else:
+                    st.warning(f"⚠️ Failed to classify {month_name}")
                 
                 progress_bar.progress((idx + 1) / len(to_classify))
             
             progress_bar.empty()
             status_text.empty()
         else:
-            st.success("All months already classified!")
+            if existing:
+                st.info("All downloaded months already classified!")
+            else:
+                st.warning("No months to classify!")
         
+        # Sort by month name
         thumbnails = sorted(thumbnails, key=lambda x: x['month_name'])
         st.session_state.classification_thumbnails = thumbnails
         
-        st.success(f"✅ Classified {len(thumbnails)} months!")
+        if thumbnails:
+            st.success(f"✅ Total: {len(thumbnails)} months classified!")
+            
+            # Immediately display results
+            st.divider()
+            st.header("📊 Classification Results")
+            display_classification_thumbnails(thumbnails)
+        else:
+            st.error("❌ No classifications produced!")
         
         return thumbnails
         
@@ -1373,7 +1419,13 @@ def main():
     
     if st.session_state.processing_complete and st.session_state.classification_thumbnails:
         st.divider()
-        st.header("📊 Results")
+        st.header("📊 Results (Cached)")
+        st.info(f"Showing {len(st.session_state.classification_thumbnails)} cached classifications")
+        display_classification_thumbnails(st.session_state.classification_thumbnails)
+    elif st.session_state.classification_thumbnails:
+        # Show cached results even if not from current processing
+        st.divider()
+        st.header("📊 Previous Results")
         display_classification_thumbnails(st.session_state.classification_thumbnails)
 
 
