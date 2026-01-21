@@ -1148,7 +1148,7 @@ def main():
         disabled=st.session_state.processing_in_progress
     )
     nodata_pct = st.sidebar.slider(
-        "Patch Nodata % (Python)", 1, 50, 5, 1,
+        "Patch Nodata % (Python)", 0, 50, 5, 0,
         help="""AFTER download: Each 224x224 patch is checked for zeros/NaN.
         If a patch has more than this % of zeros in ANY month, 
         that patch is excluded from classification in ALL months.
