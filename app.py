@@ -61,6 +61,7 @@ import json
 import subprocess
 from datetime import date
 from PIL import Image
+from io import BytesIO
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -135,6 +136,10 @@ if 'downloaded_images' not in st.session_state:
     st.session_state.downloaded_images = {}
 if 'valid_patches_mask' not in st.session_state:
     st.session_state.valid_patches_mask = None
+if 'valid_months' not in st.session_state:
+    st.session_state.valid_months = {}
+if 'pdf_report' not in st.session_state:
+    st.session_state.pdf_report = None
 # For resume capability
 if 'month_analysis_results' not in st.session_state:
     st.session_state.month_analysis_results = {}
@@ -1329,6 +1334,13 @@ def process_timeseries(aoi, start_date, end_date, model, device,
             return []
         
         st.session_state.valid_patches_mask = valid_mask
+        st.session_state.valid_months = valid_months  # Save for PDF report generation
+        
+        # IMPORTANT: Clear processed_months cache when valid_mask changes
+        # This ensures all thumbnails are generated with the same mask
+        if st.session_state.processed_months:
+            st.info("🔄 Clearing thumbnail cache to ensure consistency...")
+        st.session_state.processed_months = {}
         
         # Show which months were excluded
         excluded_count = len(downloaded_images) - len(valid_months)
@@ -1396,11 +1408,239 @@ def process_timeseries(aoi, start_date, end_date, model, device,
 
 
 # =============================================================================
+# Band Statistics and PDF Report Generation
+# =============================================================================
+def calculate_band_statistics(image_path, month_name):
+    """
+    Calculate statistics (min, median, max, mean) for each band of an image.
+    Returns a dictionary with band statistics.
+    """
+    try:
+        with rasterio.open(image_path) as src:
+            stats = {
+                'month_name': month_name,
+                'bands': {}
+            }
+            
+            for band_idx, band_name in enumerate(SPECTRAL_BANDS, start=1):
+                band_data = src.read(band_idx)
+                # Exclude zeros and NaN for statistics
+                valid_data = band_data[(band_data != 0) & (~np.isnan(band_data))]
+                
+                if len(valid_data) > 0:
+                    stats['bands'][band_name] = {
+                        'min': float(np.min(valid_data)),
+                        'max': float(np.max(valid_data)),
+                        'mean': float(np.mean(valid_data)),
+                        'median': float(np.median(valid_data)),
+                        'std': float(np.std(valid_data))
+                    }
+                else:
+                    stats['bands'][band_name] = {
+                        'min': 0.0,
+                        'max': 0.0,
+                        'mean': 0.0,
+                        'median': 0.0,
+                        'std': 0.0
+                    }
+            
+            return stats
+    except Exception as e:
+        st.warning(f"Error calculating statistics for {month_name}: {e}")
+        return None
+
+
+def generate_band_statistics_pdf(valid_months, thumbnails):
+    """
+    Generate a PDF report with band statistics for all processed images.
+    Returns PDF bytes.
+    """
+    try:
+        # Try to import reportlab, install if not available
+        try:
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import inch, cm
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+        except ImportError:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "reportlab"])
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import inch, cm
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+        
+        # Create PDF buffer
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), 
+                               leftMargin=1*cm, rightMargin=1*cm,
+                               topMargin=1*cm, bottomMargin=1*cm)
+        
+        # Styles
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=18,
+            spaceAfter=20,
+            alignment=1  # Center
+        )
+        subtitle_style = ParagraphStyle(
+            'CustomSubtitle',
+            parent=styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10
+        )
+        normal_style = styles['Normal']
+        
+        # Build content
+        content = []
+        
+        # Title
+        content.append(Paragraph("Sentinel-2 Band Statistics Report", title_style))
+        content.append(Paragraph(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", normal_style))
+        content.append(Paragraph(f"Total Images Analyzed: {len(valid_months)}", normal_style))
+        content.append(Spacer(1, 20))
+        
+        # Calculate statistics for each image
+        all_stats = []
+        month_names = sorted(valid_months.keys())
+        
+        for month_name in month_names:
+            image_path = valid_months[month_name]
+            stats = calculate_band_statistics(image_path, month_name)
+            if stats:
+                all_stats.append(stats)
+        
+        if not all_stats:
+            content.append(Paragraph("No statistics available.", normal_style))
+            doc.build(content)
+            buffer.seek(0)
+            return buffer.getvalue()
+        
+        # Summary table (all months, all bands)
+        content.append(Paragraph("Summary: Band Statistics Across All Images", subtitle_style))
+        content.append(Spacer(1, 10))
+        
+        # Create summary table header
+        summary_header = ['Band'] + [s['month_name'] for s in all_stats]
+        
+        # For each statistic type, create a section
+        for stat_type in ['mean', 'median', 'min', 'max', 'std']:
+            content.append(Paragraph(f"{stat_type.upper()} Values by Band", subtitle_style))
+            
+            table_data = [summary_header]
+            
+            for band_name in SPECTRAL_BANDS:
+                row = [band_name]
+                for stats in all_stats:
+                    value = stats['bands'].get(band_name, {}).get(stat_type, 0)
+                    row.append(f"{value:.6f}")
+                table_data.append(row)
+            
+            # Create table
+            col_widths = [1.2*cm] + [2.0*cm] * len(all_stats)
+            if len(col_widths) > 12:
+                col_widths = [1.0*cm] + [1.5*cm] * len(all_stats)
+            
+            table = Table(table_data, colWidths=col_widths)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 7),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('BACKGROUND', (0, 1), (0, -1), colors.lightgrey),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+            
+            content.append(table)
+            content.append(Spacer(1, 15))
+        
+        # Detailed statistics per image
+        content.append(PageBreak())
+        content.append(Paragraph("Detailed Statistics Per Image", title_style))
+        content.append(Spacer(1, 10))
+        
+        for stats in all_stats:
+            content.append(Paragraph(f"Image: {stats['month_name']}", subtitle_style))
+            
+            # Create detailed table for this image
+            detail_header = ['Band', 'Min', 'Max', 'Mean', 'Median', 'Std Dev']
+            detail_data = [detail_header]
+            
+            for band_name in SPECTRAL_BANDS:
+                band_stats = stats['bands'].get(band_name, {})
+                row = [
+                    band_name,
+                    f"{band_stats.get('min', 0):.6f}",
+                    f"{band_stats.get('max', 0):.6f}",
+                    f"{band_stats.get('mean', 0):.6f}",
+                    f"{band_stats.get('median', 0):.6f}",
+                    f"{band_stats.get('std', 0):.6f}"
+                ]
+                detail_data.append(row)
+            
+            detail_table = Table(detail_data, colWidths=[2*cm, 3*cm, 3*cm, 3*cm, 3*cm, 3*cm])
+            detail_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+                ('BACKGROUND', (0, 1), (0, -1), colors.lightgrey),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+            
+            content.append(detail_table)
+            content.append(Spacer(1, 20))
+        
+        # Build PDF
+        doc.build(content)
+        buffer.seek(0)
+        return buffer.getvalue()
+        
+    except Exception as e:
+        st.error(f"Error generating PDF: {e}")
+        import traceback
+        st.error(traceback.format_exc())
+        return None
+
+
+# =============================================================================
 # Display Thumbnails
 # =============================================================================
-def display_thumbnails(thumbnails):
+def display_thumbnails(thumbnails, valid_months=None):
     if not thumbnails:
         return
+    
+    # Add PDF download button at the top
+    if valid_months:
+        st.subheader("📊 Band Statistics Report")
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            if st.button("📄 Generate PDF Report", type="primary"):
+                with st.spinner("Generating PDF report with band statistics..."):
+                    pdf_bytes = generate_band_statistics_pdf(valid_months, thumbnails)
+                    if pdf_bytes:
+                        st.session_state.pdf_report = pdf_bytes
+                        st.success("✅ PDF report generated!")
+        
+        with col2:
+            if 'pdf_report' in st.session_state and st.session_state.pdf_report:
+                st.download_button(
+                    label="⬇️ Download Band Statistics Report (PDF)",
+                    data=st.session_state.pdf_report,
+                    file_name=f"band_statistics_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    mime="application/pdf"
+                )
+        
+        st.divider()
     
     mode = st.radio("Display:", ["Side by Side", "Classification", "RGB"], horizontal=True)
     st.divider()
@@ -1512,9 +1752,9 @@ def main():
     
     if st.sidebar.button("🗑️ Clear All Cache", disabled=st.session_state.processing_in_progress):
         for key in ['processed_months', 'downloaded_images', 'classification_thumbnails', 
-                    'valid_patches_mask', 'current_temp_dir', 'month_analysis_results',
+                    'valid_patches_mask', 'valid_months', 'current_temp_dir', 'month_analysis_results',
                     'failed_downloads', 'analysis_complete', 'download_complete',
-                    'processing_params', 'processing_config']:
+                    'processing_params', 'processing_config', 'pdf_report']:
             if key in st.session_state:
                 if isinstance(st.session_state[key], dict):
                     st.session_state[key] = {}
@@ -1691,6 +1931,8 @@ def main():
         st.session_state.processed_months = {}
         st.session_state.classification_thumbnails = []
         st.session_state.valid_patches_mask = None
+        st.session_state.valid_months = {}
+        st.session_state.pdf_report = None
         st.session_state.failed_downloads = []
         st.session_state.processing_complete = False
         
@@ -1784,7 +2026,10 @@ def main():
     if st.session_state.processing_complete and st.session_state.classification_thumbnails:
         st.divider()
         st.header("📊 Results")
-        display_thumbnails(st.session_state.classification_thumbnails)
+        display_thumbnails(
+            st.session_state.classification_thumbnails,
+            valid_months=st.session_state.valid_months
+        )
 
 
 if __name__ == "__main__":
