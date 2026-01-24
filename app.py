@@ -1018,27 +1018,146 @@ def classify_image_with_mask(image_path, model, device, month_name, valid_mask, 
         return None, 0
 
 
-def generate_thumbnails(image_path, classification_mask, month_name, max_size=256):
-    """Generate both RGB and classification thumbnails."""
+def get_valid_patch_bounds(valid_mask, patch_size=224, original_size=None):
+    """
+    Calculate the pixel bounds of valid patches.
+    Returns: (row_start, row_end, col_start, col_end) in pixels
+    """
+    if valid_mask is None or not np.any(valid_mask):
+        return None
+    
+    # Find rows and cols with valid patches
+    valid_rows = np.any(valid_mask, axis=1)
+    valid_cols = np.any(valid_mask, axis=0)
+    
+    # Get min/max patch indices
+    row_indices = np.where(valid_rows)[0]
+    col_indices = np.where(valid_cols)[0]
+    
+    if len(row_indices) == 0 or len(col_indices) == 0:
+        return None
+    
+    min_row, max_row = row_indices[0], row_indices[-1]
+    min_col, max_col = col_indices[0], col_indices[-1]
+    
+    # Convert to pixel coordinates
+    row_start = min_row * patch_size
+    row_end = (max_row + 1) * patch_size
+    col_start = min_col * patch_size
+    col_end = (max_col + 1) * patch_size
+    
+    # Clip to original size if provided
+    if original_size is not None:
+        row_end = min(row_end, original_size[0])
+        col_end = min(col_end, original_size[1])
+    
+    return (row_start, row_end, col_start, col_end)
+
+
+def create_pixel_mask_from_patches(valid_mask, patch_size=224, target_size=None):
+    """
+    Create a pixel-level mask from patch-level validity mask.
+    Each patch's validity is expanded to cover all its pixels.
+    
+    Returns: 2D boolean array of shape target_size (or expanded patch grid size)
+    """
+    if valid_mask is None:
+        return None
+    
+    n_patches_h, n_patches_w = valid_mask.shape
+    
+    # Create pixel mask by repeating each patch value
+    pixel_mask = np.repeat(np.repeat(valid_mask, patch_size, axis=0), patch_size, axis=1)
+    
+    # Crop to target size if provided
+    if target_size is not None:
+        pixel_mask = pixel_mask[:target_size[0], :target_size[1]]
+    
+    return pixel_mask
+
+
+def generate_thumbnails(image_path, classification_mask, month_name, valid_mask=None, original_size=None, max_size=256):
+    """
+    Generate both RGB and classification thumbnails.
+    If valid_mask is provided:
+    1. Crops both images to the valid patch bounding box
+    2. Masks out invalid patches in RGB (shows black where patches are invalid)
+    This ensures RGB and classification show exactly the same valid regions.
+    """
     try:
-        rgb_thumbnail = generate_rgb_thumbnail(image_path, month_name, max_size)
+        # Get crop bounds and pixel mask from valid_mask
+        crop_bounds = None
+        pixel_mask = None
+        if valid_mask is not None:
+            crop_bounds = get_valid_patch_bounds(valid_mask, PATCH_SIZE, original_size)
+            pixel_mask = create_pixel_mask_from_patches(valid_mask, PATCH_SIZE, original_size)
         
-        h, w = classification_mask.shape
-        pil_class = Image.fromarray(classification_mask.astype(np.uint8))
+        # Read and process RGB
+        with rasterio.open(image_path) as src:
+            red = src.read(4)
+            green = src.read(3)
+            blue = src.read(2)
+            
+            rgb = np.stack([red, green, blue], axis=-1)
+            rgb = np.nan_to_num(rgb, nan=0.0)
+            
+            def percentile_stretch(band, lower=2, upper=98):
+                valid = band[band > 0]
+                if len(valid) == 0:
+                    return np.zeros_like(band, dtype=np.uint8)
+                p_low = np.percentile(valid, lower)
+                p_high = np.percentile(valid, upper)
+                if p_high <= p_low:
+                    p_high = p_low + 0.001
+                stretched = np.clip((band - p_low) / (p_high - p_low), 0, 1)
+                return (stretched * 255).astype(np.uint8)
+            
+            rgb_uint8 = np.zeros_like(rgb, dtype=np.uint8)
+            for i in range(3):
+                rgb_uint8[:, :, i] = percentile_stretch(rgb[:, :, i])
         
+        # Apply pixel mask to RGB (set invalid patches to black)
+        if pixel_mask is not None:
+            # Expand mask to 3 channels
+            pixel_mask_3ch = np.stack([pixel_mask, pixel_mask, pixel_mask], axis=-1)
+            rgb_uint8 = np.where(pixel_mask_3ch, rgb_uint8, 0)
+        
+        # Crop both images if bounds are available
+        if crop_bounds is not None:
+            row_start, row_end, col_start, col_end = crop_bounds
+            rgb_cropped = rgb_uint8[row_start:row_end, col_start:col_end, :]
+            class_cropped = classification_mask[row_start:row_end, col_start:col_end]
+        else:
+            rgb_cropped = rgb_uint8
+            class_cropped = classification_mask
+        
+        # Create PIL images
+        pil_rgb = Image.fromarray(rgb_cropped, mode='RGB')
+        pil_class = Image.fromarray(class_cropped.astype(np.uint8))
+        
+        # Resize if needed
+        h, w = pil_rgb.size[1], pil_rgb.size[0]
         if h > max_size or w > max_size:
             scale = max_size / max(h, w)
-            pil_class = pil_class.resize((int(w * scale), int(h * scale)), Image.NEAREST)
+            new_w, new_h = int(w * scale), int(h * scale)
+            pil_rgb = pil_rgb.resize((new_w, new_h), Image.LANCZOS)
+            pil_class = pil_class.resize((new_w, new_h), Image.NEAREST)
+        
+        # Calculate building stats from cropped region (only valid pixels)
+        building_pixels = np.sum(class_cropped > 0)
+        total_pixels = class_cropped.shape[0] * class_cropped.shape[1]
         
         return {
-            'rgb_image': rgb_thumbnail,
+            'rgb_image': pil_rgb,
             'classification_image': pil_class,
             'month_name': month_name,
-            'original_size': (h, w),
-            'building_pixels': np.sum(classification_mask > 0),
-            'total_pixels': h * w
+            'original_size': classification_mask.shape,
+            'cropped_size': class_cropped.shape,
+            'building_pixels': building_pixels,
+            'total_pixels': total_pixels
         }
-    except:
+    except Exception as e:
+        st.warning(f"Error generating thumbnails for {month_name}: {e}")
         return None
 
 
@@ -1248,7 +1367,10 @@ def process_timeseries(aoi, start_date, end_date, model, device,
             )
             
             if mask is not None:
-                thumb = generate_thumbnails(valid_months[month_name], mask, month_name)
+                thumb = generate_thumbnails(
+                    valid_months[month_name], mask, month_name,
+                    valid_mask=valid_mask, original_size=original_size
+                )
                 if thumb:
                     thumb['valid_patches'] = valid_count
                     # Add gap-fill info from status
