@@ -24,16 +24,18 @@ GEE SERVER-SIDE:
 
 PYTHON CLIENT-SIDE (after download):
 5. Validate all downloaded images have SAME dimensions
-6. Check patch validity (NaN/zeros) across all downloaded months
-7. Find common valid patches (valid in ALL months)
-8. Classify only valid patches
+6. Check patch validity (NaN/zeros) for each month
+7. Find the month with MAXIMUM valid patches (reference)
+8. EXCLUDE months that don't have ALL reference patches valid
+9. Classify only valid months using reference patch mask
 
 GUARANTEES:
 ═══════════════════════════════════════════════════════════════════════════════
 ✅ All downloaded images have 0% masked pixels (GEE-side guarantee)
 ✅ All downloaded images have identical dimensions (validated in Python)
-✅ All classified months have same number of patches (validated in Python)
-✅ Only patches valid across ALL months are classified (cross-month consistency)
+✅ All classified months have SAME valid patches (reference mask)
+✅ Months with missing patches are EXCLUDED (not reduced to minimum)
+✅ Maximum number of valid patches preserved
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -727,7 +729,7 @@ def generate_rgb_thumbnail(image_path, month_name, max_size=256):
 # =============================================================================
 # PYTHON-SIDE PATCH VALIDITY CHECKING
 # =============================================================================
-def check_patch_validity(patch, nodata_threshold_percent=5):
+def check_patch_validity(patch, nodata_threshold_percent=0):
     """Check if a patch has minimal nodata."""
     if np.any(np.isnan(patch)):
         return False
@@ -746,7 +748,7 @@ def check_patch_validity(patch, nodata_threshold_percent=5):
     return True
 
 
-def get_patch_validity_mask(image_path, patch_size=224, nodata_threshold_percent=5):
+def get_patch_validity_mask(image_path, patch_size=224, nodata_threshold_percent=0):
     """Create a mask showing which patches are valid for a single image."""
     try:
         with rasterio.open(image_path) as src:
@@ -778,15 +780,18 @@ def get_patch_validity_mask(image_path, patch_size=224, nodata_threshold_percent
         return None, None, None
 
 
-def find_common_valid_patches(downloaded_images, nodata_threshold_percent=5):
+def find_common_valid_patches(downloaded_images, nodata_threshold_percent=0):
     """
-    Find patches that are valid across ALL months.
+    Find patches that are valid and EXCLUDE months that don't have all valid patches.
     
-    IMPORTANT: This function validates that ALL downloaded images have:
-    1. The same dimensions (height, width)
-    2. The same number of patches
+    NEW LOGIC:
+    1. Calculate validity mask for each month
+    2. Find the month with the MOST valid patches (reference)
+    3. Use that reference mask as the "expected" valid patches
+    4. Exclude any month that doesn't have ALL those patches valid
+    5. Return the reference mask and list of valid months
     
-    Returns: (combined_validity_mask, original_size) or (None, None) if validation fails
+    Returns: (validity_mask, original_size, valid_months_dict) or (None, None, None) if fails
     """
     st.info("🔍 Analyzing patch validity across all months...")
     
@@ -794,7 +799,7 @@ def find_common_valid_patches(downloaded_images, nodata_threshold_percent=5):
     
     if len(month_names) == 0:
         st.error("❌ No downloaded images to analyze!")
-        return None, None
+        return None, None, None
     
     # =========================================================================
     # STEP 1: Validate all images have the same dimensions
@@ -811,7 +816,7 @@ def find_common_valid_patches(downloaded_images, nodata_threshold_percent=5):
                 dimensions[month_name] = {'height': h, 'width': w, 'bands': bands}
         except Exception as e:
             st.error(f"❌ Cannot read {month_name}: {e}")
-            return None, None
+            return None, None, None
     
     # Check if all dimensions match
     first_month = month_names[0]
@@ -827,12 +832,12 @@ def find_common_valid_patches(downloaded_images, nodata_threshold_percent=5):
         st.error(f"Reference ({first_month}): {reference_dim['height']}x{reference_dim['width']}")
         st.error(f"Mismatched: {', '.join(mismatched)}")
         st.warning("All months must have identical image dimensions for consistent patch analysis.")
-        return None, None
+        return None, None, None
     
     st.success(f"✅ All {len(month_names)} images have same dimensions: {reference_dim['height']}x{reference_dim['width']} ({reference_dim['bands']} bands)")
     
     # =========================================================================
-    # STEP 2: Calculate patch grid dimensions
+    # STEP 2: Calculate patch grid and get validity mask for each month
     # =========================================================================
     h, w = reference_dim['height'], reference_dim['width']
     n_patches_h = int(np.ceil(h / PATCH_SIZE))
@@ -841,16 +846,13 @@ def find_common_valid_patches(downloaded_images, nodata_threshold_percent=5):
     
     st.write(f"**Step 2: Patch grid**: {n_patches_h} x {n_patches_w} = **{total_patches} patches** per image")
     
-    # =========================================================================
-    # STEP 3: Build combined validity mask
-    # =========================================================================
-    st.write("**Step 3: Checking patch validity across all months...**")
-    
-    combined_mask = None
-    original_size = (h, w)
+    st.write("**Step 3: Calculating validity for each month...**")
     
     progress_bar = st.progress(0)
-    validity_report = []
+    
+    # Store validity mask for each month
+    month_validity_masks = {}
+    month_valid_counts = {}
     
     for idx, month_name in enumerate(month_names):
         image_path = downloaded_images[month_name]
@@ -866,48 +868,82 @@ def find_common_valid_patches(downloaded_images, nodata_threshold_percent=5):
         # Verify grid size matches expected
         if validity_mask.shape != (n_patches_h, n_patches_w):
             st.error(f"❌ {month_name}: Patch grid mismatch! Expected {(n_patches_h, n_patches_w)}, got {validity_mask.shape}")
-            return None, None
+            return None, None, None
         
-        valid_count = np.sum(validity_mask)
-        validity_report.append({
-            'month': month_name,
-            'valid': valid_count,
-            'total': total_patches,
-            'percent': 100 * valid_count / total_patches
-        })
-        
-        if combined_mask is None:
-            combined_mask = validity_mask.copy()
-        else:
-            combined_mask = combined_mask & validity_mask
+        month_validity_masks[month_name] = validity_mask
+        month_valid_counts[month_name] = np.sum(validity_mask)
         
         progress_bar.progress((idx + 1) / len(month_names))
     
     progress_bar.empty()
     
+    if len(month_validity_masks) == 0:
+        st.error("❌ Could not analyze any months!")
+        return None, None, None
+    
     # =========================================================================
-    # STEP 4: Summary
+    # STEP 4: Find the month with MAXIMUM valid patches (reference)
     # =========================================================================
-    if combined_mask is None:
-        st.error("❌ Could not create validity mask!")
-        return None, None
+    st.write("**Step 4: Finding reference mask (maximum valid patches)...**")
     
-    # Show per-month validity
-    with st.expander("📊 Per-Month Validity Report", expanded=False):
-        for report in validity_report:
-            st.write(f"  {report['month']}: {report['valid']}/{report['total']} patches valid ({report['percent']:.1f}%)")
+    # Find max valid patch count
+    max_valid_count = max(month_valid_counts.values())
     
-    final_valid = np.sum(combined_mask)
+    # Find all months with max valid count (could be multiple)
+    max_months = [mn for mn, count in month_valid_counts.items() if count == max_valid_count]
     
+    st.info(f"📊 Maximum valid patches: **{max_valid_count}/{total_patches}** ({100*max_valid_count/total_patches:.1f}%)")
+    st.write(f"   Months with max patches: {', '.join(max_months)}")
+    
+    # Use the first max month as reference
+    reference_month = max_months[0]
+    reference_mask = month_validity_masks[reference_month]
+    
+    # =========================================================================
+    # STEP 5: Check which months have ALL reference patches valid
+    # =========================================================================
+    st.write("**Step 5: Filtering months that match reference mask...**")
+    
+    valid_months = {}
+    excluded_months = {}
+    
+    for month_name, mask in month_validity_masks.items():
+        # Check if this month has ALL patches that are valid in reference
+        # A month is valid if: everywhere reference_mask is True, this mask is also True
+        matches_reference = np.all(mask[reference_mask] == True)
+        
+        if matches_reference:
+            valid_months[month_name] = downloaded_images[month_name]
+            st.write(f"   ✅ {month_name}: {month_valid_counts[month_name]}/{total_patches} patches - **INCLUDED**")
+        else:
+            # Count how many reference patches are missing
+            missing_count = np.sum(reference_mask & ~mask)
+            excluded_months[month_name] = {
+                'valid_count': month_valid_counts[month_name],
+                'missing_count': missing_count
+            }
+            st.write(f"   ❌ {month_name}: {month_valid_counts[month_name]}/{total_patches} patches - **EXCLUDED** (missing {missing_count} patches)")
+    
+    # =========================================================================
+    # STEP 6: Summary
+    # =========================================================================
     st.divider()
-    st.success(f"✅ **{final_valid}/{total_patches}** patches valid across ALL {len(month_names)} months ({100*final_valid/total_patches:.1f}%)")
     
-    if final_valid == 0:
-        st.error("❌ No patches are valid across all months!")
-        st.warning("Try: selecting a different region, different time period, or increasing nodata threshold")
-        return None, None
+    if len(valid_months) == 0:
+        st.error("❌ No months match the reference mask!")
+        st.warning("This shouldn't happen - at least the reference month should match.")
+        return None, None, None
     
-    return combined_mask, original_size
+    st.success(f"✅ **{len(valid_months)}/{len(month_validity_masks)}** months have all {max_valid_count} valid patches")
+    
+    if excluded_months:
+        with st.expander(f"🚫 Excluded Months ({len(excluded_months)})", expanded=True):
+            for month_name, info in excluded_months.items():
+                st.write(f"  • {month_name}: had {info['valid_count']} patches, missing {info['missing_count']} from reference")
+    
+    original_size = (h, w)
+    
+    return reference_mask, original_size, valid_months
 
 
 def classify_image_with_mask(image_path, model, device, month_name, valid_mask, original_size):
@@ -1164,30 +1200,37 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         st.success(f"✅ Downloaded {len(downloaded_images)}/{total_months} months")
         
         # =====================================================================
-        # PHASE 3: Patch validity
+        # PHASE 3: Patch validity - Find MAX patches and exclude non-conforming months
         # =====================================================================
-        st.header("Phase 3: Patch Validity")
+        st.header("Phase 3: Patch Validity Analysis")
         
-        valid_mask, original_size = find_common_valid_patches(downloaded_images, nodata_threshold_percent)
+        valid_mask, original_size, valid_months = find_common_valid_patches(downloaded_images, nodata_threshold_percent)
         
-        if valid_mask is None:
+        if valid_mask is None or valid_months is None:
             return []
         
         st.session_state.valid_patches_mask = valid_mask
         
+        # Show which months were excluded
+        excluded_count = len(downloaded_images) - len(valid_months)
+        if excluded_count > 0:
+            st.warning(f"⚠️ {excluded_count} months excluded due to missing patches")
+        
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.imshow(valid_mask, cmap='RdYlGn', vmin=0, vmax=1)
-        ax.set_title("Valid Patches (Green=Valid)")
+        ax.set_title(f"Reference Valid Patches ({np.sum(valid_mask)} patches)")
         st.pyplot(fig)
         plt.close()
         
         # =====================================================================
-        # PHASE 4: Classification (with cache)
+        # PHASE 4: Classification (only valid months, with cache)
         # =====================================================================
         st.header("Phase 4: Classification")
         
+        st.info(f"🧠 Classifying **{len(valid_months)}** months (excluded {excluded_count} with missing patches)")
+        
         thumbnails = []
-        month_names = sorted(downloaded_images.keys())
+        month_names = sorted(valid_months.keys())  # Use valid_months, not downloaded_images
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -1201,11 +1244,11 @@ def process_timeseries(aoi, start_date, end_date, model, device,
             status_text.text(f"🧠 {month_name} ({idx+1}/{len(month_names)})...")
             
             mask, valid_count = classify_image_with_mask(
-                downloaded_images[month_name], model, device, month_name, valid_mask, original_size
+                valid_months[month_name], model, device, month_name, valid_mask, original_size
             )
             
             if mask is not None:
-                thumb = generate_thumbnails(downloaded_images[month_name], mask, month_name)
+                thumb = generate_thumbnails(valid_months[month_name], mask, month_name)
                 if thumb:
                     thumb['valid_patches'] = valid_count
                     # Add gap-fill info from status
@@ -1313,11 +1356,11 @@ def main():
         disabled=st.session_state.processing_in_progress
     )
     nodata_pct = st.sidebar.slider(
-        "Patch Nodata % (Python)", 0, 50, 5, 1,
+        "Patch Nodata % (Python)", 0, 50, 0, 1,
         help="""AFTER download: Each 224x224 patch is checked for zeros/NaN.
-        If a patch has more than this % of zeros in ANY month, 
-        that patch is excluded from classification in ALL months.
-        This ensures consistent valid patches across the time series.""",
+        If a patch has more than this % of zeros, that patch is considered invalid.
+        Months with missing patches (compared to the best month) are EXCLUDED.
+        Default 0% means only fully valid patches are used.""",
         disabled=st.session_state.processing_in_progress
     )
     
