@@ -1453,55 +1453,15 @@ def calculate_band_statistics(image_path, month_name):
 def generate_band_statistics_pdf(valid_months, thumbnails):
     """
     Generate a PDF report with band statistics for all processed images.
+    Uses matplotlib for PDF generation (no external dependencies).
     Returns PDF bytes.
     """
     try:
-        # Try to import reportlab, install if not available
-        try:
-            from reportlab.lib import colors
-            from reportlab.lib.pagesizes import A4, landscape
-            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-            from reportlab.lib.units import inch, cm
-            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "reportlab"])
-            from reportlab.lib import colors
-            from reportlab.lib.pagesizes import A4, landscape
-            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-            from reportlab.lib.units import inch, cm
-            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+        from matplotlib.backends.backend_pdf import PdfPages
+        import matplotlib.pyplot as plt
         
         # Create PDF buffer
         buffer = BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), 
-                               leftMargin=1*cm, rightMargin=1*cm,
-                               topMargin=1*cm, bottomMargin=1*cm)
-        
-        # Styles
-        styles = getSampleStyleSheet()
-        title_style = ParagraphStyle(
-            'CustomTitle',
-            parent=styles['Heading1'],
-            fontSize=18,
-            spaceAfter=20,
-            alignment=1  # Center
-        )
-        subtitle_style = ParagraphStyle(
-            'CustomSubtitle',
-            parent=styles['Heading2'],
-            fontSize=14,
-            spaceAfter=10
-        )
-        normal_style = styles['Normal']
-        
-        # Build content
-        content = []
-        
-        # Title
-        content.append(Paragraph("Sentinel-2 Band Statistics Report", title_style))
-        content.append(Paragraph(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", normal_style))
-        content.append(Paragraph(f"Total Images Analyzed: {len(valid_months)}", normal_style))
-        content.append(Spacer(1, 20))
         
         # Calculate statistics for each image
         all_stats = []
@@ -1514,94 +1474,119 @@ def generate_band_statistics_pdf(valid_months, thumbnails):
                 all_stats.append(stats)
         
         if not all_stats:
-            content.append(Paragraph("No statistics available.", normal_style))
-            doc.build(content)
-            buffer.seek(0)
-            return buffer.getvalue()
+            return None
         
-        # Summary table (all months, all bands)
-        content.append(Paragraph("Summary: Band Statistics Across All Images", subtitle_style))
-        content.append(Spacer(1, 10))
+        with PdfPages(buffer) as pdf:
+            # Page 1: Title and Summary
+            fig, ax = plt.subplots(figsize=(11.69, 8.27))  # A4 landscape
+            ax.axis('off')
+            
+            # Title
+            ax.text(0.5, 0.95, 'Sentinel-2 Band Statistics Report', 
+                   fontsize=20, fontweight='bold', ha='center', va='top',
+                   transform=ax.transAxes)
+            ax.text(0.5, 0.88, f'Generated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+                   fontsize=12, ha='center', va='top', transform=ax.transAxes)
+            ax.text(0.5, 0.83, f'Total Images Analyzed: {len(all_stats)}',
+                   fontsize=12, ha='center', va='top', transform=ax.transAxes)
+            ax.text(0.5, 0.78, f'Months: {month_names[0]} to {month_names[-1]}',
+                   fontsize=12, ha='center', va='top', transform=ax.transAxes)
+            
+            # Band list
+            ax.text(0.5, 0.70, 'Bands Analyzed:', fontsize=14, fontweight='bold',
+                   ha='center', va='top', transform=ax.transAxes)
+            bands_text = ', '.join(SPECTRAL_BANDS)
+            ax.text(0.5, 0.65, bands_text, fontsize=10, ha='center', va='top',
+                   transform=ax.transAxes)
+            
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close(fig)
+            
+            # Pages for each statistic type: MEAN, MEDIAN, MIN, MAX, STD
+            for stat_type, stat_title in [('mean', 'MEAN'), ('median', 'MEDIAN'), 
+                                           ('min', 'MIN'), ('max', 'MAX'), ('std', 'STD DEV')]:
+                fig, ax = plt.subplots(figsize=(11.69, 8.27))
+                ax.axis('off')
+                
+                ax.text(0.5, 0.98, f'{stat_title} Values by Band', 
+                       fontsize=16, fontweight='bold', ha='center', va='top',
+                       transform=ax.transAxes)
+                
+                # Create table data
+                col_labels = ['Band'] + [s['month_name'] for s in all_stats]
+                table_data = []
+                
+                for band_name in SPECTRAL_BANDS:
+                    row = [band_name]
+                    for stats in all_stats:
+                        value = stats['bands'].get(band_name, {}).get(stat_type, 0)
+                        row.append(f'{value:.4f}')
+                    table_data.append(row)
+                
+                # Create table
+                table = ax.table(cellText=table_data, colLabels=col_labels,
+                                loc='center', cellLoc='center')
+                table.auto_set_font_size(False)
+                table.set_fontsize(7)
+                table.scale(1.2, 1.5)
+                
+                # Style header
+                for j in range(len(col_labels)):
+                    table[(0, j)].set_facecolor('#4472C4')
+                    table[(0, j)].set_text_props(color='white', fontweight='bold')
+                
+                # Style band column
+                for i in range(1, len(SPECTRAL_BANDS) + 1):
+                    table[(i, 0)].set_facecolor('#D9E2F3')
+                    table[(i, 0)].set_text_props(fontweight='bold')
+                
+                pdf.savefig(fig, bbox_inches='tight')
+                plt.close(fig)
+            
+            # Detailed pages for each image
+            for stats in all_stats:
+                fig, ax = plt.subplots(figsize=(11.69, 8.27))
+                ax.axis('off')
+                
+                ax.text(0.5, 0.98, f'Detailed Statistics: {stats["month_name"]}', 
+                       fontsize=16, fontweight='bold', ha='center', va='top',
+                       transform=ax.transAxes)
+                
+                # Create detailed table
+                col_labels = ['Band', 'Min', 'Max', 'Mean', 'Median', 'Std Dev']
+                table_data = []
+                
+                for band_name in SPECTRAL_BANDS:
+                    band_stats = stats['bands'].get(band_name, {})
+                    row = [
+                        band_name,
+                        f"{band_stats.get('min', 0):.6f}",
+                        f"{band_stats.get('max', 0):.6f}",
+                        f"{band_stats.get('mean', 0):.6f}",
+                        f"{band_stats.get('median', 0):.6f}",
+                        f"{band_stats.get('std', 0):.6f}"
+                    ]
+                    table_data.append(row)
+                
+                table = ax.table(cellText=table_data, colLabels=col_labels,
+                                loc='center', cellLoc='center')
+                table.auto_set_font_size(False)
+                table.set_fontsize(9)
+                table.scale(1.5, 1.8)
+                
+                # Style header
+                for j in range(len(col_labels)):
+                    table[(0, j)].set_facecolor('#1F4E79')
+                    table[(0, j)].set_text_props(color='white', fontweight='bold')
+                
+                # Style band column
+                for i in range(1, len(SPECTRAL_BANDS) + 1):
+                    table[(i, 0)].set_facecolor('#D6DCE5')
+                    table[(i, 0)].set_text_props(fontweight='bold')
+                
+                pdf.savefig(fig, bbox_inches='tight')
+                plt.close(fig)
         
-        # Create summary table header
-        summary_header = ['Band'] + [s['month_name'] for s in all_stats]
-        
-        # For each statistic type, create a section
-        for stat_type in ['mean', 'median', 'min', 'max', 'std']:
-            content.append(Paragraph(f"{stat_type.upper()} Values by Band", subtitle_style))
-            
-            table_data = [summary_header]
-            
-            for band_name in SPECTRAL_BANDS:
-                row = [band_name]
-                for stats in all_stats:
-                    value = stats['bands'].get(band_name, {}).get(stat_type, 0)
-                    row.append(f"{value:.6f}")
-                table_data.append(row)
-            
-            # Create table
-            col_widths = [1.2*cm] + [2.0*cm] * len(all_stats)
-            if len(col_widths) > 12:
-                col_widths = [1.0*cm] + [1.5*cm] * len(all_stats)
-            
-            table = Table(table_data, colWidths=col_widths)
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, -1), 7),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-                ('BACKGROUND', (0, 1), (0, -1), colors.lightgrey),
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ]))
-            
-            content.append(table)
-            content.append(Spacer(1, 15))
-        
-        # Detailed statistics per image
-        content.append(PageBreak())
-        content.append(Paragraph("Detailed Statistics Per Image", title_style))
-        content.append(Spacer(1, 10))
-        
-        for stats in all_stats:
-            content.append(Paragraph(f"Image: {stats['month_name']}", subtitle_style))
-            
-            # Create detailed table for this image
-            detail_header = ['Band', 'Min', 'Max', 'Mean', 'Median', 'Std Dev']
-            detail_data = [detail_header]
-            
-            for band_name in SPECTRAL_BANDS:
-                band_stats = stats['bands'].get(band_name, {})
-                row = [
-                    band_name,
-                    f"{band_stats.get('min', 0):.6f}",
-                    f"{band_stats.get('max', 0):.6f}",
-                    f"{band_stats.get('mean', 0):.6f}",
-                    f"{band_stats.get('median', 0):.6f}",
-                    f"{band_stats.get('std', 0):.6f}"
-                ]
-                detail_data.append(row)
-            
-            detail_table = Table(detail_data, colWidths=[2*cm, 3*cm, 3*cm, 3*cm, 3*cm, 3*cm])
-            detail_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, -1), 9),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
-                ('BACKGROUND', (0, 1), (0, -1), colors.lightgrey),
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ]))
-            
-            content.append(detail_table)
-            content.append(Spacer(1, 20))
-        
-        # Build PDF
-        doc.build(content)
         buffer.seek(0)
         return buffer.getvalue()
         
