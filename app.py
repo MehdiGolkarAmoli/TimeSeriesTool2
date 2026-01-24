@@ -1330,12 +1330,6 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         
         st.session_state.valid_patches_mask = valid_mask
         
-        # IMPORTANT: Clear processed_months cache when valid_mask changes
-        # This ensures all thumbnails are generated with the same mask
-        if st.session_state.processed_months:
-            st.info("🔄 Clearing thumbnail cache to ensure consistency...")
-        st.session_state.processed_months = {}
-        
         # Show which months were excluded
         excluded_count = len(downloaded_images) - len(valid_months)
         if excluded_count > 0:
