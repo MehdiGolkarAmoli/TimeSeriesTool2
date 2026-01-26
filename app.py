@@ -1600,6 +1600,16 @@ def generate_band_statistics_pdf(valid_months, thumbnails):
 # =============================================================================
 # Display Thumbnails
 # =============================================================================
+def get_image_download_data(image_path, month_name):
+    """Read GeoTIFF file and return bytes for download."""
+    try:
+        with open(image_path, 'rb') as f:
+            return f.read()
+    except Exception as e:
+        st.warning(f"Error reading {month_name}: {e}")
+        return None
+
+
 def display_thumbnails(thumbnails, valid_months=None):
     if not thumbnails:
         return
@@ -1640,6 +1650,18 @@ def display_thumbnails(thumbnails, valid_months=None):
                     pct = (t['building_pixels'] / t['total_pixels']) * 100
                     suffix = " (filled)" if t.get('gap_filled') else ""
                     cols[j*2].image(t['rgb_image'], caption=f"{t['month_name']} RGB{suffix}")
+                    # Add download button under RGB
+                    if valid_months and t['month_name'] in valid_months:
+                        image_path = valid_months[t['month_name']]
+                        image_data = get_image_download_data(image_path, t['month_name'])
+                        if image_data:
+                            cols[j*2].download_button(
+                                label=f"⬇️ Download {t['month_name']}",
+                                data=image_data,
+                                file_name=f"sentinel2_{t['month_name']}_12bands.tif",
+                                mime="image/tiff",
+                                key=f"dl_sidebyside_{t['month_name']}"
+                            )
                     cols[j*2+1].image(t['classification_image'], caption=f"{t['month_name']} ({pct:.1f}%)")
     else:
         key = 'classification_image' if mode == "Classification" else 'rgb_image'
@@ -1653,6 +1675,18 @@ def display_thumbnails(thumbnails, valid_months=None):
                     cap = f"{t['month_name']} ({pct:.1f}%)" if mode == "Classification" else t['month_name']
                     if t.get(key):
                         cols[c].image(t[key], caption=cap)
+                        # Add download button under RGB images only
+                        if mode == "RGB" and valid_months and t['month_name'] in valid_months:
+                            image_path = valid_months[t['month_name']]
+                            image_data = get_image_download_data(image_path, t['month_name'])
+                            if image_data:
+                                cols[c].download_button(
+                                    label=f"⬇️ Download",
+                                    data=image_data,
+                                    file_name=f"sentinel2_{t['month_name']}_12bands.tif",
+                                    mime="image/tiff",
+                                    key=f"dl_rgb_{t['month_name']}"
+                                )
 
 
 # =============================================================================
