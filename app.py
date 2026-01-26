@@ -97,7 +97,7 @@ MIN_BAND_FILE_SIZE = 10000
 MIN_MULTIBAND_FILE_SIZE = 100000
 
 # Cloud masking thresholds (from JS)
-CLOUD_PROB_THRESHOLD = 50
+CLOUD_PROB_THRESHOLD = 65
 CDI_THRESHOLD = -0.5
 
 # Gap-filling threshold
@@ -1398,6 +1398,25 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         status_text.empty()
         
         st.success(f"✅ Classified {len(thumbnails)} months!")
+        
+        # Filter out images with abnormally low building percentage (likely haze/snow)
+        if len(thumbnails) >= 2:
+            building_pcts = [(t['building_pixels'] / t['total_pixels']) * 100 for t in thumbnails]
+            median_pct = np.median(building_pcts)
+            
+            filtered_thumbnails = []
+            for t in thumbnails:
+                pct = (t['building_pixels'] / t['total_pixels']) * 100
+                if pct < (median_pct - 8.0):
+                    print(f"🚫 Excluded {t['month_name']}: {pct:.1f}% buildings (median={median_pct:.1f}%) - likely haze or snow")
+                    # Also remove from valid_months
+                    if t['month_name'] in st.session_state.valid_months:
+                        del st.session_state.valid_months[t['month_name']]
+                else:
+                    filtered_thumbnails.append(t)
+            
+            thumbnails = filtered_thumbnails
+        
         return thumbnails
         
     except Exception as e:
@@ -1595,6 +1614,7 @@ def generate_band_statistics_pdf(valid_months, thumbnails):
         import traceback
         st.error(traceback.format_exc())
         return None
+
 
 
 # =============================================================================
