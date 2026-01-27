@@ -1713,15 +1713,8 @@ def display_thumbnails(thumbnails, valid_months=None):
 # Main Application
 # =============================================================================
 def main():
-    st.title("🏗️ Building Classification v06")
-    st.markdown("""
-    | Status | Condition | Download? |
-    |--------|-----------|-----------|
-    | `no_data` | No images | ❌ |
-    | `skipped` | masked > 30% | ❌ |
-    | `complete` | masked == 0% | ✅ |
-    | `rejected` | masked > 0% after gap-fill | ❌ |
-    """)
+    st.title("🏗️ Building Change Detection")
+   
     
     ee_ok, ee_msg = initialize_earth_engine()
     if not ee_ok:
