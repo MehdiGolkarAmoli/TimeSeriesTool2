@@ -1882,6 +1882,18 @@ def display_thumbnails(thumbnails, valid_months=None):
 # Main Application
 # =============================================================================
 def main():
+    # Create tabs for the application
+    tab1, tab2 = st.tabs(["🏗️ Classification", "🔍 Change Detection"])
+    
+    with tab1:
+        main_classification_tab()
+    
+    with tab2:
+        change_detection_tab()
+
+
+def main_classification_tab():
+    """Main classification tab content"""
     st.title("🏗️ Building Classification v06")
     st.markdown("""
     | Status | Condition | Download? |
@@ -2242,191 +2254,306 @@ def main():
             valid_months=st.session_state.valid_months
         )
         
-        # =================================================================
-        # CHANGE DETECTION TAB
-        # =================================================================
-        st.divider()
-        st.header("4️⃣ Change Detection Analysis")
+        # Info about change detection tab
+        if st.session_state.probability_maps:
+            st.success(f"✅ Classification complete! {len(st.session_state.probability_maps)} probability maps available. Go to **Change Detection** tab to analyze building changes.")
+
+
+def change_detection_tab():
+    """Change Detection Analysis Tab"""
+    st.title("🔍 Change Detection Analysis")
+    
+    # Check if we have probability maps
+    if not st.session_state.probability_maps:
+        st.warning("⚠️ No probability maps available. Please complete classification in the **Classification** tab first.")
+        st.info("The change detection algorithm requires probability maps from the building classification.")
+        return
+    
+    n_months = len(st.session_state.probability_maps)
+    sorted_months = sorted(st.session_state.probability_maps.keys())
+    
+    st.success(f"✅ **{n_months} months** of probability maps available: {sorted_months[0]} → {sorted_months[-1]}")
+    
+    # =================================================================
+    # PARAMETERS SECTION
+    # =================================================================
+    st.header("⚙️ Algorithm Parameters")
+    
+    # Algorithm explanation
+    with st.expander("ℹ️ Algorithm Explanation", expanded=False):
+        st.markdown("""
+        **Change Detection Algorithm:**
         
-        # Check if we have probability maps
-        if not st.session_state.probability_maps:
-            st.warning("⚠️ No probability maps available. Please run classification first.")
+        A pixel is considered a "change" (non-building → building) if:
+        
+        1. ✅ Pixel **starts** as non-building (probability < non-building threshold)
+        2. ✅ Pixel **ends** as building (probability > building threshold)
+        3. ✅ Only **ONE transition** from non-building to building (no back-and-forth fluctuations)
+        4. ✅ Stays non-building for at least **min non-building duration** months before transition
+        5. ✅ Stays building for at least **min building duration** months after transition
+        
+        This ensures we detect **reliable, persistent** changes and filter out model noise.
+        """)
+    
+    # Parameters in two columns with text inputs
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📊 Thresholds")
+        non_building_thr = st.text_input(
+            "Non-building threshold",
+            value="0.2",
+            help="Pixels with probability BELOW this value are considered non-building (0.0 - 0.5)",
+            key="cd_non_building_thr"
+        )
+        building_thr = st.text_input(
+            "Building threshold",
+            value="0.8",
+            help="Pixels with probability ABOVE this value are considered building (0.5 - 1.0)",
+            key="cd_building_thr"
+        )
+    
+    with col2:
+        st.subheader("⏱️ Duration Constraints")
+        min_non_building = st.text_input(
+            "Min non-building duration (months)",
+            value="2",
+            help="Pixel must stay as non-building for at least this many months at the START",
+            key="cd_min_non_building"
+        )
+        min_building = st.text_input(
+            "Min building duration (months)",
+            value="2",
+            help="Pixel must stay as building for at least this many months at the END",
+            key="cd_min_building"
+        )
+    
+    # Validate inputs
+    try:
+        non_building_thr_val = float(non_building_thr)
+        building_thr_val = float(building_thr)
+        min_non_building_val = int(min_non_building)
+        min_building_val = int(min_building)
+        
+        # Validation checks
+        errors = []
+        if not (0.0 <= non_building_thr_val <= 0.5):
+            errors.append("Non-building threshold must be between 0.0 and 0.5")
+        if not (0.5 <= building_thr_val <= 1.0):
+            errors.append("Building threshold must be between 0.5 and 1.0")
+        if min_non_building_val < 1:
+            errors.append("Min non-building duration must be at least 1")
+        if min_building_val < 1:
+            errors.append("Min building duration must be at least 1")
+        if min_non_building_val + min_building_val > n_months:
+            errors.append(f"Total duration ({min_non_building_val + min_building_val}) exceeds available months ({n_months})")
+        
+        if errors:
+            for err in errors:
+                st.error(f"❌ {err}")
+            params_valid = False
         else:
-            n_months = len(st.session_state.probability_maps)
-            st.info(f"📊 **{n_months} months** of probability maps available for change detection")
+            params_valid = True
+            st.info(f"📊 Parameters: non-building < {non_building_thr_val}, building > {building_thr_val}, min NB duration = {min_non_building_val}, min B duration = {min_building_val}")
+    
+    except ValueError as e:
+        st.error(f"❌ Invalid parameter value. Please enter valid numbers.")
+        params_valid = False
+    
+    # =================================================================
+    # RUN CHANGE DETECTION
+    # =================================================================
+    st.divider()
+    
+    if params_valid:
+        if st.button("🔍 Run Change Detection", type="primary", use_container_width=True):
+            with st.spinner("Analyzing building transitions across time series..."):
+                # Run change detection
+                change_mask, stats = analyze_building_transition(
+                    st.session_state.probability_maps,
+                    non_building_thr=non_building_thr_val,
+                    building_thr=building_thr_val,
+                    non_building_duration=min_non_building_val,
+                    building_duration=min_building_val
+                )
+                
+                if change_mask is not None:
+                    st.session_state.change_detection_result = {
+                        'mask': change_mask,
+                        'stats': stats,
+                        'params': {
+                            'non_building_thr': non_building_thr_val,
+                            'building_thr': building_thr_val,
+                            'min_non_building': min_non_building_val,
+                            'min_building': min_building_val
+                        }
+                    }
+                    st.success("✅ Change detection completed!")
+                    st.rerun()
+                else:
+                    st.error(f"❌ Change detection failed: {stats.get('error', 'Unknown error')}")
+    
+    # =================================================================
+    # DISPLAY RESULTS
+    # =================================================================
+    if st.session_state.change_detection_result:
+        result = st.session_state.change_detection_result
+        change_mask = result['mask']
+        stats = result['stats']
+        params = result['params']
+        
+        st.divider()
+        st.header("📈 Change Detection Results")
+        
+        # Statistics
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Change Pixels", f"{stats['change_pixels']:,}")
+        col2.metric("Total Pixels", f"{stats['total_pixels']:,}")
+        col3.metric("Change Rate", f"{stats['change_percentage']:.2f}%")
+        col4.metric("Months Analyzed", stats['n_months'])
+        
+        st.info(f"📅 Time range: **{stats['first_month']}** → **{stats['last_month']}**")
+        
+        # =================================================================
+        # VISUALIZATION
+        # =================================================================
+        st.subheader("🖼️ Results Visualization")
+        
+        # Get first and last month images
+        first_month = stats['first_month']
+        last_month = stats['last_month']
+        
+        first_image_path = st.session_state.valid_months.get(first_month)
+        last_image_path = st.session_state.valid_months.get(last_month)
+        
+        # Get valid patch bounds for cropping
+        valid_mask = st.session_state.valid_patches_mask
+        original_size = change_mask.shape
+        crop_bounds = get_valid_patch_bounds(valid_mask, PATCH_SIZE, original_size)
+        
+        # Generate RGB images
+        first_rgb = generate_rgb_from_sentinel(first_image_path) if first_image_path else None
+        last_rgb = generate_rgb_from_sentinel(last_image_path) if last_image_path else None
+        
+        # Get first and last classification masks
+        first_prob = st.session_state.probability_maps.get(first_month)
+        last_prob = st.session_state.probability_maps.get(last_month)
+        first_class = (first_prob > 0.5).astype(np.uint8) * 255 if first_prob is not None else None
+        last_class = (last_prob > 0.5).astype(np.uint8) * 255 if last_prob is not None else None
+        
+        if first_rgb is not None and last_rgb is not None and crop_bounds is not None:
+            row_start, row_end, col_start, col_end = crop_bounds
             
-            # Parameters
-            st.subheader("⚙️ Change Detection Parameters")
+            # Crop images to valid area
+            first_rgb_cropped = first_rgb[row_start:row_end, col_start:col_end, :]
+            last_rgb_cropped = last_rgb[row_start:row_end, col_start:col_end, :]
+            change_mask_cropped = change_mask[row_start:row_end, col_start:col_end]
+            first_class_cropped = first_class[row_start:row_end, col_start:col_end] if first_class is not None else None
+            last_class_cropped = last_class[row_start:row_end, col_start:col_end] if last_class is not None else None
             
-            col1, col2 = st.columns(2)
+            # Create figure with 2 rows
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            
+            # Row 1: RGB images and change mask
+            axes[0, 0].imshow(first_rgb_cropped)
+            axes[0, 0].set_title(f"First RGB: {first_month}", fontsize=12)
+            axes[0, 0].axis('off')
+            
+            axes[0, 1].imshow(last_rgb_cropped)
+            axes[0, 1].set_title(f"Last RGB: {last_month}", fontsize=12)
+            axes[0, 1].axis('off')
+            
+            # Change detection overlay
+            change_color = np.zeros((*change_mask_cropped.shape, 3), dtype=np.uint8)
+            change_color[change_mask_cropped == 1] = [255, 0, 0]  # Red for change
+            axes[0, 2].imshow(last_rgb_cropped)
+            axes[0, 2].imshow(change_color, alpha=0.6)
+            axes[0, 2].set_title(f"Change Detection\n({stats['change_pixels']:,} pixels)", fontsize=12)
+            axes[0, 2].axis('off')
+            
+            # Row 2: Classification masks
+            if first_class_cropped is not None:
+                axes[1, 0].imshow(first_class_cropped, cmap='Greens')
+                axes[1, 0].set_title(f"First Classification: {first_month}", fontsize=12)
+                axes[1, 0].axis('off')
+            
+            if last_class_cropped is not None:
+                axes[1, 1].imshow(last_class_cropped, cmap='Reds')
+                axes[1, 1].set_title(f"Last Classification: {last_month}", fontsize=12)
+                axes[1, 1].axis('off')
+            
+            # Change mask only
+            axes[1, 2].imshow(change_mask_cropped, cmap='hot')
+            axes[1, 2].set_title(f"Change Mask\n({stats['change_percentage']:.2f}% change)", fontsize=12)
+            axes[1, 2].axis('off')
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+            
+            # =================================================================
+            # DOWNLOAD SECTION
+            # =================================================================
+            st.subheader("⬇️ Download Results")
+            
+            col1, col2, col3 = st.columns(3)
             
             with col1:
-                st.markdown("**Thresholds**")
-                non_building_thr = st.slider(
-                    "Non-building threshold",
-                    min_value=0.0, max_value=0.5, value=0.2, step=0.05,
-                    help="Pixels with probability BELOW this are considered non-building"
-                )
-                building_thr = st.slider(
-                    "Building threshold",
-                    min_value=0.5, max_value=1.0, value=0.8, step=0.05,
-                    help="Pixels with probability ABOVE this are considered building"
-                )
+                # Save change mask as GeoTIFF with coordinates
+                if first_image_path and os.path.exists(first_image_path):
+                    try:
+                        with rasterio.open(first_image_path) as src:
+                            # Get the transform and CRS from the original image
+                            out_meta = src.meta.copy()
+                            out_meta.update({
+                                'count': 1,
+                                'dtype': 'uint8',
+                                'height': change_mask.shape[0],
+                                'width': change_mask.shape[1]
+                            })
+                            
+                            # Create GeoTIFF in memory
+                            geotiff_buffer = BytesIO()
+                            with rasterio.open(geotiff_buffer, 'w', **out_meta) as dst:
+                                dst.write(change_mask.astype(np.uint8), 1)
+                            
+                            geotiff_buffer.seek(0)
+                            st.download_button(
+                                label="📥 Download Change Mask (GeoTIFF)",
+                                data=geotiff_buffer.getvalue(),
+                                file_name=f"change_detection_{first_month}_to_{last_month}.tif",
+                                mime="image/tiff"
+                            )
+                    except Exception as e:
+                        st.error(f"Error creating GeoTIFF: {e}")
+                        # Fallback to PNG
+                        change_img = Image.fromarray((change_mask_cropped * 255).astype(np.uint8))
+                        buf = BytesIO()
+                        change_img.save(buf, format='PNG')
+                        buf.seek(0)
+                        st.download_button(
+                            label="📥 Download Change Mask (PNG)",
+                            data=buf.getvalue(),
+                            file_name=f"change_detection_{first_month}_to_{last_month}.png",
+                            mime="image/png"
+                        )
             
             with col2:
-                st.markdown("**Duration Constraints**")
-                min_non_building = st.slider(
-                    "Min non-building duration (months)",
-                    min_value=1, max_value=n_months-1, value=min(2, n_months-1), step=1,
-                    help="Pixel must stay as non-building for at least this many months at the START"
-                )
-                min_building = st.slider(
-                    "Min building duration (months)",
-                    min_value=1, max_value=n_months-1, value=min(2, n_months-1), step=1,
-                    help="Pixel must stay as building for at least this many months at the END"
+                # Download cropped change mask as PNG for quick viewing
+                change_img = Image.fromarray((change_mask_cropped * 255).astype(np.uint8))
+                buf = BytesIO()
+                change_img.save(buf, format='PNG')
+                buf.seek(0)
+                st.download_button(
+                    label="📥 Download Cropped Preview (PNG)",
+                    data=buf.getvalue(),
+                    file_name=f"change_preview_{first_month}_to_{last_month}.png",
+                    mime="image/png"
                 )
             
-            # Algorithm explanation
-            with st.expander("ℹ️ Algorithm Explanation"):
-                st.markdown("""
-                **Change Detection Algorithm:**
-                
-                A pixel is considered a "change" (non-building → building) if:
-                
-                1. ✅ Pixel starts as **non-building** (probability < non-building threshold)
-                2. ✅ Pixel ends as **building** (probability > building threshold)
-                3. ✅ Only **ONE transition** from non-building to building (no back-and-forth)
-                4. ✅ Stays non-building for at least **min non-building duration** months
-                5. ✅ Stays building for at least **min building duration** months
-                
-                This ensures we detect **reliable, persistent** changes and filter out noise.
-                """)
-            
-            # Check if enough months
-            min_required = min_non_building + min_building
-            if n_months < min_required:
-                st.error(f"❌ Need at least {min_required} months, but only {n_months} available. Reduce duration constraints.")
-            else:
-                # Run button
-                if st.button("🔍 Run Change Detection", type="primary"):
-                    with st.spinner("Analyzing building transitions..."):
-                        # Run change detection
-                        change_mask, stats = analyze_building_transition(
-                            st.session_state.probability_maps,
-                            non_building_thr=non_building_thr,
-                            building_thr=building_thr,
-                            non_building_duration=min_non_building,
-                            building_duration=min_building
-                        )
-                        
-                        if change_mask is not None:
-                            st.session_state.change_detection_result = {
-                                'mask': change_mask,
-                                'stats': stats,
-                                'params': {
-                                    'non_building_thr': non_building_thr,
-                                    'building_thr': building_thr,
-                                    'min_non_building': min_non_building,
-                                    'min_building': min_building
-                                }
-                            }
-                            st.success("✅ Change detection completed!")
-                        else:
-                            st.error(f"❌ Change detection failed: {stats.get('error', 'Unknown error')}")
-                
-                # Display results if available
-                if st.session_state.change_detection_result:
-                    result = st.session_state.change_detection_result
-                    change_mask = result['mask']
-                    stats = result['stats']
-                    params = result['params']
-                    
-                    # Statistics
-                    st.subheader("📈 Change Detection Statistics")
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Change Pixels", f"{stats['change_pixels']:,}")
-                    col2.metric("Total Pixels", f"{stats['total_pixels']:,}")
-                    col3.metric("Change Rate", f"{stats['change_percentage']:.2f}%")
-                    col4.metric("Months Analyzed", stats['n_months'])
-                    
-                    st.info(f"📅 Time range: **{stats['first_month']}** → **{stats['last_month']}**")
-                    
-                    # Display images
-                    st.subheader("🖼️ Results Visualization")
-                    
-                    # Get first and last month images
-                    sorted_months = sorted(st.session_state.valid_months.keys())
-                    first_month = sorted_months[0]
-                    last_month = sorted_months[-1]
-                    
-                    first_image_path = st.session_state.valid_months[first_month]
-                    last_image_path = st.session_state.valid_months[last_month]
-                    
-                    # Get valid patch bounds for cropping
-                    valid_mask = st.session_state.valid_patches_mask
-                    original_size = change_mask.shape
-                    crop_bounds = get_valid_patch_bounds(valid_mask, PATCH_SIZE, original_size)
-                    
-                    # Generate RGB images
-                    first_rgb = generate_rgb_from_sentinel(first_image_path)
-                    last_rgb = generate_rgb_from_sentinel(last_image_path)
-                    
-                    if first_rgb is not None and last_rgb is not None and crop_bounds is not None:
-                        row_start, row_end, col_start, col_end = crop_bounds
-                        
-                        # Crop images to valid area
-                        first_rgb_cropped = first_rgb[row_start:row_end, col_start:col_end, :]
-                        last_rgb_cropped = last_rgb[row_start:row_end, col_start:col_end, :]
-                        change_mask_cropped = change_mask[row_start:row_end, col_start:col_end]
-                        
-                        # Create figure
-                        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-                        
-                        # First RGB
-                        axes[0].imshow(first_rgb_cropped)
-                        axes[0].set_title(f"First Image: {first_month}", fontsize=12)
-                        axes[0].axis('off')
-                        
-                        # Last RGB
-                        axes[1].imshow(last_rgb_cropped)
-                        axes[1].set_title(f"Last Image: {last_month}", fontsize=12)
-                        axes[1].axis('off')
-                        
-                        # Change detection mask
-                        # Create colored mask (red for change)
-                        change_color = np.zeros((*change_mask_cropped.shape, 3), dtype=np.uint8)
-                        change_color[change_mask_cropped == 1] = [255, 0, 0]  # Red for change
-                        
-                        axes[2].imshow(last_rgb_cropped)
-                        axes[2].imshow(change_color, alpha=0.6)
-                        axes[2].set_title(f"Change Detection\n({stats['change_pixels']:,} pixels, {stats['change_percentage']:.2f}%)", fontsize=12)
-                        axes[2].axis('off')
-                        
-                        plt.tight_layout()
-                        st.pyplot(fig)
-                        plt.close()
-                        
-                        # Download buttons
-                        st.subheader("⬇️ Download Results")
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            # Save change mask as image
-                            change_img = Image.fromarray((change_mask_cropped * 255).astype(np.uint8))
-                            buf = BytesIO()
-                            change_img.save(buf, format='PNG')
-                            buf.seek(0)
-                            
-                            st.download_button(
-                                label="📥 Download Change Mask (PNG)",
-                                data=buf.getvalue(),
-                                file_name=f"change_detection_{first_month}_to_{last_month}.png",
-                                mime="image/png"
-                            )
-                        
-                        with col2:
-                            # Save parameters and stats as text
-                            report_text = f"""Change Detection Report
+            with col3:
+                # Save parameters and stats as text
+                report_text = f"""Change Detection Report
 ================================
 Time Range: {first_month} to {last_month}
 Months Analyzed: {stats['n_months']}
@@ -2442,14 +2569,401 @@ Results:
 - Total valid pixels: {stats['total_pixels']:,}
 - Change rate: {stats['change_percentage']:.4f}%
 """
-                            st.download_button(
-                                label="📄 Download Report (TXT)",
-                                data=report_text,
-                                file_name=f"change_detection_report_{first_month}_to_{last_month}.txt",
-                                mime="text/plain"
-                            )
+                st.download_button(
+                    label="📄 Download Report (TXT)",
+                    data=report_text,
+                    file_name=f"change_detection_report_{first_month}_to_{last_month}.txt",
+                    mime="text/plain"
+                )
+            
+            # =================================================================
+            # INTERACTIVE MAP
+            # =================================================================
+            st.divider()
+            st.subheader("🗺️ Interactive Map")
+            
+            display_interactive_map(
+                first_image_path, last_image_path,
+                first_class, last_class, change_mask,
+                first_month, last_month, crop_bounds, original_size
+            )
+        
+        else:
+            st.error("❌ Could not generate visualization. RGB images or crop bounds not available.")
+
+
+def display_interactive_map(first_image_path, last_image_path, first_class, last_class, 
+                            change_mask, first_month, last_month, crop_bounds, original_size):
+    """Display interactive Folium map with all layers - matching old app style"""
+    import folium
+    from folium import plugins
+    import streamlit.components.v1 as components
+    import tempfile
+    import base64
+    from rasterio.warp import calculate_default_transform, reproject, Resampling
+    
+    st.info("""
+    **Interactive Map Controls:**
+    - Use the **layer control** (top-right) to toggle layers on/off
+    - Click **fullscreen button** (top-left) to expand
+    - **Base layers**: Google Satellite (100%), Google Maps (70%), OpenStreetMap (50%)
+    - **Overlays**: Sentinel RGB, Classifications (Green=Before, Red=After), Change Detection (Pink)
+    """)
+    
+    try:
+        # Get georeferencing info from first image
+        if not first_image_path or not os.path.exists(first_image_path):
+            st.warning("Cannot create interactive map: source image not found")
+            return
+        
+        with rasterio.open(first_image_path) as src:
+            utm_crs = src.crs
+            utm_transform = src.transform
+            utm_bounds = src.bounds
+            utm_height = src.height
+            utm_width = src.width
+            
+            # Calculate center for map
+            center_x = (utm_bounds.left + utm_bounds.right) / 2
+            center_y = (utm_bounds.bottom + utm_bounds.top) / 2
+        
+        # Reproject center to WGS84
+        from rasterio.warp import transform as rio_transform
+        center_lon, center_lat = rio_transform(utm_crs, 'EPSG:4326', [center_x], [center_y])
+        center = [center_lat[0], center_lon[0]]
+        
+        temp_dir = tempfile.mkdtemp()
+        dst_crs = 'EPSG:4326'
+        
+        # Variables to store reprojected paths and target transform
+        target_transform = None
+        target_width = None
+        target_height = None
+        target_bounds = None
+        
+        before_class_wgs84_path = None
+        after_class_wgs84_path = None
+        change_mask_wgs84_path = None
+        before_rgb_wgs84_path = None
+        after_rgb_wgs84_path = None
+        
+        # Helper function to reproject single band data
+        def reproject_to_wgs84(data, data_name, dtype='uint8'):
+            nonlocal target_transform, target_width, target_height, target_bounds
+            
+            utm_path = os.path.join(temp_dir, f"{data_name}_utm.tif")
+            wgs84_path = os.path.join(temp_dir, f"{data_name}_wgs84.tif")
+            
+            # Save as UTM GeoTIFF
+            with rasterio.open(
+                utm_path, 'w', driver='GTiff',
+                height=data.shape[0], width=data.shape[1],
+                count=1, dtype=dtype, crs=utm_crs, transform=utm_transform
+            ) as dst:
+                dst.write(data.astype(dtype), 1)
+            
+            # Reproject to WGS84
+            with rasterio.open(utm_path) as src_utm:
+                if target_transform is None:
+                    # Calculate target transform once
+                    target_transform, target_width, target_height = calculate_default_transform(
+                        src_utm.crs, dst_crs, src_utm.width, src_utm.height, *src_utm.bounds
+                    )
+                
+                dst_kwargs = src_utm.meta.copy()
+                dst_kwargs.update({
+                    'crs': dst_crs,
+                    'transform': target_transform,
+                    'width': target_width,
+                    'height': target_height
+                })
+                
+                with rasterio.open(wgs84_path, 'w', **dst_kwargs) as dst_wgs:
+                    reproject(
+                        source=rasterio.band(src_utm, 1),
+                        destination=rasterio.band(dst_wgs, 1),
+                        src_transform=src_utm.transform,
+                        src_crs=src_utm.crs,
+                        dst_transform=target_transform,
+                        dst_crs=dst_crs,
+                        resampling=Resampling.nearest
+                    )
+                    if target_bounds is None:
+                        target_bounds = dst_wgs.bounds
+            
+            return wgs84_path
+        
+        # Helper function to reproject RGB data
+        def reproject_rgb_to_wgs84(rgb_data, data_name):
+            nonlocal target_transform, target_width, target_height, target_bounds
+            
+            utm_path = os.path.join(temp_dir, f"{data_name}_utm.tif")
+            wgs84_path = os.path.join(temp_dir, f"{data_name}_wgs84.tif")
+            
+            # Save as UTM GeoTIFF (3 bands)
+            with rasterio.open(
+                utm_path, 'w', driver='GTiff',
+                height=rgb_data.shape[0], width=rgb_data.shape[1],
+                count=3, dtype='uint8', crs=utm_crs, transform=utm_transform
+            ) as dst:
+                for i in range(3):
+                    dst.write(rgb_data[:, :, i], i + 1)
+            
+            # Reproject to WGS84
+            with rasterio.open(utm_path) as src_utm:
+                if target_transform is None:
+                    target_transform, target_width, target_height = calculate_default_transform(
+                        src_utm.crs, dst_crs, src_utm.width, src_utm.height, *src_utm.bounds
+                    )
+                
+                dst_kwargs = src_utm.meta.copy()
+                dst_kwargs.update({
+                    'crs': dst_crs,
+                    'transform': target_transform,
+                    'width': target_width,
+                    'height': target_height
+                })
+                
+                with rasterio.open(wgs84_path, 'w', **dst_kwargs) as dst_wgs:
+                    for i in range(1, 4):
+                        reproject(
+                            source=rasterio.band(src_utm, i),
+                            destination=rasterio.band(dst_wgs, i),
+                            src_transform=src_utm.transform,
+                            src_crs=src_utm.crs,
+                            dst_transform=target_transform,
+                            dst_crs=dst_crs,
+                            resampling=Resampling.bilinear
+                        )
+                    if target_bounds is None:
+                        target_bounds = dst_wgs.bounds
+            
+            return wgs84_path
+        
+        # Helper function to convert raster to Folium overlay
+        def raster_to_folium_overlay(raster_path, colormap='viridis', opacity=0.7, 
+                                     is_binary=False, is_change_mask=False, is_rgb=False):
+            with rasterio.open(raster_path) as src:
+                bounds = src.bounds
+                bounds_latlon = [[bounds.bottom, bounds.left], [bounds.top, bounds.right]]
+                
+                if is_rgb and src.count >= 3:
+                    # RGB image
+                    rgb_data = src.read([1, 2, 3])
+                    img_array = np.transpose(rgb_data, (1, 2, 0))
+                    pil_img = Image.fromarray(img_array.astype(np.uint8))
+                elif is_binary:
+                    # Binary classification mask
+                    data = src.read(1)
+                    rgba_array = np.zeros((data.shape[0], data.shape[1], 4), dtype=np.uint8)
+                    mask_val = data > 0
+                    if colormap == 'Greens':
+                        rgba_array[mask_val, 0:3] = [0, 255, 0]  # Green
+                    elif colormap == 'Reds':
+                        rgba_array[mask_val, 0:3] = [255, 0, 0]  # Red
+                    rgba_array[mask_val, 3] = 180  # Alpha
+                    pil_img = Image.fromarray(rgba_array, 'RGBA')
+                elif is_change_mask:
+                    # Change detection mask - light pink
+                    data = src.read(1)
+                    rgba_array = np.zeros((data.shape[0], data.shape[1], 4), dtype=np.uint8)
+                    mask_val = data > 0
+                    rgba_array[mask_val, 0:3] = [255, 182, 193]  # Light pink
+                    rgba_array[mask_val, 3] = 200  # Semi-transparent
+                    pil_img = Image.fromarray(rgba_array, 'RGBA')
+                else:
+                    # Single band with colormap
+                    data = src.read(1)
+                    import matplotlib.cm as cm
+                    data_min, data_max = np.nanmin(data), np.nanmax(data)
+                    if data_max > data_min:
+                        data_norm = (data - data_min) / (data_max - data_min)
                     else:
-                        st.error("❌ Could not generate visualization. RGB images or crop bounds not available.")
+                        data_norm = np.zeros_like(data)
+                    cmap_func = cm.get_cmap(colormap)
+                    img_array = cmap_func(data_norm)
+                    img_array = (img_array[:, :, :3] * 255).astype(np.uint8)
+                    pil_img = Image.fromarray(img_array)
+                
+                img_buffer = BytesIO()
+                pil_img.save(img_buffer, format='PNG')
+                img_str = base64.b64encode(img_buffer.getvalue()).decode()
+                return f"data:image/png;base64,{img_str}", bounds_latlon
+        
+        # Reproject classification masks
+        if first_class is not None:
+            first_class_binary = (first_class > 0).astype(np.uint8)
+            before_class_wgs84_path = reproject_to_wgs84(first_class_binary, f"before_class_{first_month}")
+        
+        if last_class is not None:
+            last_class_binary = (last_class > 0).astype(np.uint8)
+            after_class_wgs84_path = reproject_to_wgs84(last_class_binary, f"after_class_{last_month}")
+        
+        # Reproject change mask
+        if change_mask is not None:
+            change_mask_wgs84_path = reproject_to_wgs84(change_mask.astype(np.uint8), "change_mask")
+        
+        # Generate and reproject RGB images
+        first_rgb = generate_rgb_from_sentinel(first_image_path)
+        last_rgb = generate_rgb_from_sentinel(last_image_path) if last_image_path else None
+        
+        if first_rgb is not None:
+            before_rgb_wgs84_path = reproject_rgb_to_wgs84(first_rgb, f"before_rgb_{first_month}")
+        
+        if last_rgb is not None:
+            after_rgb_wgs84_path = reproject_rgb_to_wgs84(last_rgb, f"after_rgb_{last_month}")
+        
+        # Create Folium map
+        m = folium.Map(location=center, zoom_start=15, tiles=None)
+        
+        # Add fullscreen control
+        plugins.Fullscreen(
+            position='topleft',
+            title='Expand to fullscreen',
+            title_cancel='Exit fullscreen',
+            force_separate_button=True
+        ).add_to(m)
+        
+        # BASE LAYERS - mutually exclusive background layers
+        # Google Satellite at 100% opacity (default)
+        folium.TileLayer(
+            tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+            attr='Google Satellite',
+            name='Google Satellite',
+            overlay=False,
+            control=True
+        ).add_to(m)
+        
+        # Google Maps
+        folium.TileLayer(
+            tiles='https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',
+            attr='Google Maps',
+            name='Google Maps',
+            overlay=False,
+            control=True
+        ).add_to(m)
+        
+        # OpenStreetMap
+        folium.TileLayer(
+            tiles='OpenStreetMap',
+            name='OpenStreetMap',
+            overlay=False,
+            control=True
+        ).add_to(m)
+        
+        # OVERLAY LAYERS - stack on top of base layers
+        # Sentinel RGB layers
+        if before_rgb_wgs84_path:
+            try:
+                img_data, bounds = raster_to_folium_overlay(before_rgb_wgs84_path, is_rgb=True)
+                folium.raster_layers.ImageOverlay(
+                    image=img_data,
+                    bounds=bounds,
+                    opacity=0.8,
+                    name=f"First Sentinel-2 RGB ({first_month})",
+                    overlay=True,
+                    control=True,
+                    show=False
+                ).add_to(m)
+            except Exception as e:
+                st.warning(f"Could not add first Sentinel RGB layer: {e}")
+        
+        if after_rgb_wgs84_path:
+            try:
+                img_data, bounds = raster_to_folium_overlay(after_rgb_wgs84_path, is_rgb=True)
+                folium.raster_layers.ImageOverlay(
+                    image=img_data,
+                    bounds=bounds,
+                    opacity=0.8,
+                    name=f"Last Sentinel-2 RGB ({last_month})",
+                    overlay=True,
+                    control=True,
+                    show=False
+                ).add_to(m)
+            except Exception as e:
+                st.warning(f"Could not add last Sentinel RGB layer: {e}")
+        
+        # Classification layers
+        if before_class_wgs84_path:
+            try:
+                img_data, bounds = raster_to_folium_overlay(
+                    before_class_wgs84_path, colormap='Greens', is_binary=True
+                )
+                folium.raster_layers.ImageOverlay(
+                    image=img_data,
+                    bounds=bounds,
+                    opacity=0.7,
+                    name=f"First Classification ({first_month}) - Green",
+                    overlay=True,
+                    control=True,
+                    show=True
+                ).add_to(m)
+            except Exception as e:
+                st.warning(f"Could not add first classification layer: {e}")
+        
+        if after_class_wgs84_path:
+            try:
+                img_data, bounds = raster_to_folium_overlay(
+                    after_class_wgs84_path, colormap='Reds', is_binary=True
+                )
+                folium.raster_layers.ImageOverlay(
+                    image=img_data,
+                    bounds=bounds,
+                    opacity=0.7,
+                    name=f"Last Classification ({last_month}) - Red",
+                    overlay=True,
+                    control=True,
+                    show=True
+                ).add_to(m)
+            except Exception as e:
+                st.warning(f"Could not add last classification layer: {e}")
+        
+        # Change detection mask (top overlay) - light pink
+        if change_mask_wgs84_path:
+            try:
+                img_data, bounds = raster_to_folium_overlay(
+                    change_mask_wgs84_path, is_change_mask=True
+                )
+                folium.raster_layers.ImageOverlay(
+                    image=img_data,
+                    bounds=bounds,
+                    opacity=0.8,
+                    name=f"Change Detection ({first_month} → {last_month}) - Pink",
+                    overlay=True,
+                    control=True,
+                    show=True
+                ).add_to(m)
+            except Exception as e:
+                st.warning(f"Could not add change detection layer: {e}")
+        
+        # Fit map to bounds
+        if target_bounds:
+            m.fit_bounds([[target_bounds.bottom, target_bounds.left], 
+                         [target_bounds.top, target_bounds.right]])
+        
+        # Add layer control
+        folium.LayerControl(position='topright', collapsed=False).add_to(m)
+        
+        # Display the map using components.html
+        map_html = m.get_root().render()
+        components.html(map_html, height=600)
+        
+        st.caption("""
+        **Layer Legend:**
+        - 🟢 **Green**: First month classification (buildings at start)
+        - 🔴 **Red**: Last month classification (buildings at end)
+        - 🩷 **Pink**: Change detection (new buildings detected)
+        
+        **Base Layers:**
+        - Google Satellite: Full resolution satellite imagery
+        - Google Maps: Street map with labels
+        - OpenStreetMap: Community-maintained map
+        """)
+        
+    except Exception as e:
+        st.error(f"Error creating interactive map: {e}")
+        import traceback
+        st.code(traceback.format_exc())
 
 
 if __name__ == "__main__":
