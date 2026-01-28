@@ -165,11 +165,17 @@ if 'probability_maps' not in st.session_state:
     st.session_state.probability_maps = {}
 if 'change_detection_result' not in st.session_state:
     st.session_state.change_detection_result = None
-# NEW: For change detection
-if 'probability_maps' not in st.session_state:
-    st.session_state.probability_maps = {}
-if 'change_detection_result' not in st.session_state:
-    st.session_state.change_detection_result = None
+# NEW: For comprehensive logging system
+if 'processing_log' not in st.session_state:
+    st.session_state.processing_log = []
+if 'monthly_component_images' not in st.session_state:
+    st.session_state.monthly_component_images = {}  # {month_name: [list of RGB arrays at 100m]}
+if 'monthly_image_counts' not in st.session_state:
+    st.session_state.monthly_image_counts = {}  # {month_name: count}
+if 'change_timing_map' not in st.session_state:
+    st.session_state.change_timing_map = None  # Array showing which month each pixel changed
+if 'log_pdf_bytes' not in st.session_state:
+    st.session_state.log_pdf_bytes = None
 
 
 # =============================================================================
@@ -182,6 +188,35 @@ def normalized(img):
     if max_val == min_val:
         return np.zeros_like(img)
     return (img - min_val) / (max_val - min_val)
+
+
+# =============================================================================
+# Logging Helper Functions
+# =============================================================================
+def add_log_entry(message, level="INFO", include_timestamp=True):
+    """Add an entry to the processing log."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = {
+        'timestamp': timestamp,
+        'level': level,
+        'message': message
+    }
+    if 'processing_log' not in st.session_state:
+        st.session_state.processing_log = []
+    st.session_state.processing_log.append(entry)
+    
+    # Also print to console for debugging
+    if include_timestamp:
+        print(f"[{timestamp}] [{level}] {message}")
+
+
+def clear_log():
+    """Clear the processing log."""
+    st.session_state.processing_log = []
+    st.session_state.monthly_component_images = {}
+    st.session_state.monthly_image_counts = {}
+    st.session_state.change_timing_map = None
+    st.session_state.log_pdf_bytes = None
 
 
 # =============================================================================
@@ -549,6 +584,7 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
     2. Checks masked pixel percentage
     3. Applies gap-filling if 0% < masked <= 30%
     4. Downloads only if final masked == 0%
+    5. Captures component images at 100m for logging
     
     Returns: (output_path, status, message)
     """
@@ -558,14 +594,18 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
     
     output_file = os.path.join(temp_dir, f"sentinel2_{month_name}.tif")
     
+    add_log_entry(f"Processing month: {month_name}", "INFO")
+    
     # Check cache first
     if os.path.exists(output_file):
         is_valid, msg = validate_geotiff_file(output_file, expected_bands=len(SPECTRAL_BANDS))
         if is_valid:
+            add_log_entry(f"{month_name}: Using cached file", "INFO")
             if status_placeholder:
                 status_placeholder.info(f"✅ {month_name} using cached file")
             return output_file, STATUS_COMPLETE, "Cached"
         else:
+            add_log_entry(f"{month_name}: Cache invalid ({msg}), re-processing", "WARNING")
             if status_placeholder:
                 status_placeholder.warning(f"⚠️ {month_name} cache invalid, re-processing...")
             os.remove(output_file)
@@ -583,12 +623,27 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
         monthly_images = cloud_free_collection.filterDate(month_start, month_end)
         image_count = monthly_images.size().getInfo()
         
+        # Store image count for logging
+        st.session_state.monthly_image_counts[month_name] = image_count
+        add_log_entry(f"{month_name}: Found {image_count} cloud-free images", "INFO")
+        
         # CHECK 1: No images
         if image_count == 0:
+            add_log_entry(f"{month_name}: REJECTED - No images available", "WARNING")
             return None, STATUS_NO_DATA, "No images available"
         
         if status_placeholder:
             status_placeholder.text(f"📥 {month_name}: Creating composite from {image_count} images...")
+        
+        # Download component images at 100m for logging (RGB preview)
+        try:
+            add_log_entry(f"{month_name}: Downloading {image_count} component image previews at 100m", "INFO")
+            component_rgbs = download_component_images_for_log(monthly_images, aoi, month_name, image_count)
+            if component_rgbs:
+                st.session_state.monthly_component_images[month_name] = component_rgbs
+                add_log_entry(f"{month_name}: Captured {len(component_rgbs)} component image previews", "INFO")
+        except Exception as e:
+            add_log_entry(f"{month_name}: Failed to capture component images: {e}", "WARNING")
         
         # Create frequency map and median composite
         def create_valid_mask(img):
@@ -609,26 +664,33 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
         total_count = ee.Number(total_stats.get('frequency')).getInfo()
         
         if total_count == 0:
+            add_log_entry(f"{month_name}: REJECTED - No valid pixels", "WARNING")
             return None, STATUS_NO_DATA, "No valid pixels"
         
         masked_percent = (masked_count / total_count) * 100
+        add_log_entry(f"{month_name}: Masked pixels: {masked_percent:.2f}% ({masked_count}/{total_count})", "INFO")
         
         # CHECK 2: Too many masked (> 30%)
         if masked_percent > MAX_MASKED_PERCENT_FOR_GAPFILL:
+            add_log_entry(f"{month_name}: SKIPPED - Masked {masked_percent:.1f}% > {MAX_MASKED_PERCENT_FOR_GAPFILL}%", "WARNING")
             return None, STATUS_SKIPPED, f"Masked {masked_percent:.1f}% > {MAX_MASKED_PERCENT_FOR_GAPFILL}%"
         
         # CHECK 3: No masked pixels - ready to download
         if masked_percent == 0:
+            add_log_entry(f"{month_name}: Complete (0% masked), starting download at {scale}m", "INFO")
             if status_placeholder:
                 status_placeholder.text(f"📥 {month_name}: Complete (0% masked), downloading...")
             
             path = download_composite(composite, aoi, output_file, month_name, scale, status_placeholder)
             if path:
+                add_log_entry(f"{month_name}: Download SUCCESSFUL", "INFO")
                 return path, STATUS_COMPLETE, "Complete (0% masked)"
             else:
+                add_log_entry(f"{month_name}: Download FAILED", "ERROR")
                 return None, STATUS_REJECTED, "Download failed"
         
         # GAP-FILL: 0% < masked <= 30%
+        add_log_entry(f"{month_name}: Starting gap-fill ({masked_percent:.1f}% masked)", "INFO")
         if status_placeholder:
             status_placeholder.text(f"📥 {month_name}: Gap-filling ({masked_percent:.1f}% masked)...")
         
@@ -655,8 +717,10 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
         sorted_images = images_with_distance.sort('time_distance', True)
         
         candidate_count = sorted_images.size().getInfo()
+        add_log_entry(f"{month_name}: Found {candidate_count} gap-fill candidates from adjacent months", "INFO")
         
         if candidate_count == 0:
+            add_log_entry(f"{month_name}: REJECTED - No gap-fill candidates", "WARNING")
             return None, STATUS_REJECTED, f"No gap-fill candidates, {masked_percent:.1f}% still masked"
         
         # Create mosaic (closest pixel first)
@@ -684,20 +748,79 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
         
         # CHECK 4: After gap-fill
         if still_masked_count == 0:
+            add_log_entry(f"{month_name}: Gap-fill SUCCESSFUL, starting download", "INFO")
             if status_placeholder:
                 status_placeholder.text(f"📥 {month_name}: Gap-filled successfully, downloading...")
             
             path = download_composite(filled_composite, aoi, output_file, month_name, scale, status_placeholder)
             if path:
+                add_log_entry(f"{month_name}: Download SUCCESSFUL after gap-fill", "INFO")
                 return path, STATUS_COMPLETE, f"Complete after gap-fill (was {masked_percent:.1f}%)"
             else:
+                add_log_entry(f"{month_name}: Download FAILED after gap-fill", "ERROR")
                 return None, STATUS_REJECTED, "Download failed after gap-fill"
         else:
             still_masked_pct = (still_masked_count / total_count) * 100
+            add_log_entry(f"{month_name}: REJECTED - {still_masked_pct:.1f}% still masked after gap-fill", "WARNING")
             return None, STATUS_REJECTED, f"{still_masked_pct:.1f}% still masked after gap-fill"
         
     except Exception as e:
+        add_log_entry(f"{month_name}: ERROR - {str(e)}", "ERROR")
         return None, STATUS_NO_DATA, f"Error: {str(e)}"
+
+
+def download_component_images_for_log(monthly_images, aoi, month_name, image_count, max_images=10):
+    """
+    Download RGB previews of component images at 100m resolution for logging.
+    Returns list of RGB numpy arrays.
+    """
+    component_rgbs = []
+    
+    try:
+        # Limit to max_images to avoid excessive downloads
+        actual_count = min(image_count, max_images)
+        
+        # Get list of images
+        image_list = monthly_images.toList(actual_count)
+        
+        for i in range(actual_count):
+            try:
+                img = ee.Image(image_list.get(i))
+                
+                # Get image date for logging
+                img_date = ee.Date(img.get('system:time_start')).format('YYYY-MM-dd').getInfo()
+                
+                # Get RGB bands (B4, B3, B2) at 100m resolution
+                rgb_img = img.select(['B4', 'B3', 'B2'])
+                
+                # Get download URL at 100m
+                region = aoi.bounds().getInfo()['coordinates']
+                url = rgb_img.getThumbURL({
+                    'region': region,
+                    'dimensions': 256,  # Small thumbnail
+                    'format': 'png',
+                    'min': 0,
+                    'max': 0.3  # Typical reflectance range
+                })
+                
+                # Download the thumbnail
+                response = requests.get(url, timeout=30)
+                if response.status_code == 200:
+                    img_pil = Image.open(BytesIO(response.content))
+                    img_array = np.array(img_pil.convert('RGB'))
+                    component_rgbs.append({
+                        'date': img_date,
+                        'rgb': img_array
+                    })
+            except Exception as e:
+                add_log_entry(f"{month_name}: Failed to get component image {i+1}: {e}", "WARNING")
+                continue
+        
+        return component_rgbs
+        
+    except Exception as e:
+        add_log_entry(f"{month_name}: Failed to download component images: {e}", "WARNING")
+        return []
 
 
 # =============================================================================
@@ -1191,6 +1314,16 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                        resume=False):
     """Main processing pipeline - v05 style: combined analysis + download."""
     try:
+        # Initialize logging for new processing
+        if not resume:
+            clear_log()
+        
+        add_log_entry(f"{'RESUME' if resume else 'START'}: Processing pipeline initiated", "INFO")
+        add_log_entry(f"Date range: {start_date} to {end_date}", "INFO")
+        add_log_entry(f"Cloud percentage threshold: {cloudy_pixel_percentage}%", "INFO")
+        add_log_entry(f"Scale: {scale}m", "INFO")
+        add_log_entry(f"Nodata threshold: {nodata_threshold_percent}%", "INFO")
+        
         if st.session_state.current_temp_dir is None or not os.path.exists(st.session_state.current_temp_dir):
             st.session_state.current_temp_dir = tempfile.mkdtemp()
         temp_dir = st.session_state.current_temp_dir
@@ -1199,6 +1332,7 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         end_dt = datetime.datetime.strptime(end_date, '%Y-%m-%d')
         total_months = (end_dt.year - start_dt.year) * 12 + (end_dt.month - start_dt.month)
         
+        add_log_entry(f"Total months to process: {total_months}", "INFO")
         st.info(f"📅 Processing {total_months} months | 📁 {temp_dir}")
         
         # Extended date range (M-1 to M+1) for gap-filling
@@ -1208,16 +1342,19 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         # =====================================================================
         # PHASE 1: Create cloud-free collection
         # =====================================================================
+        add_log_entry("PHASE 1: Creating cloud-free collection", "INFO")
         st.header("Phase 1: Cloud-Free Collection")
         st.info(f"☁️ Cloud mask: prob > {CLOUD_PROB_THRESHOLD}, CDI < {CDI_THRESHOLD}")
         
         cloud_free_collection = create_cloud_free_collection(
             aoi, extended_start, extended_end, cloudy_pixel_percentage
         )
+        add_log_entry("Cloud-free collection created successfully", "INFO")
         
         # =====================================================================
         # PHASE 2: Download all months (v05 style - combined analysis + download)
         # =====================================================================
+        add_log_entry("PHASE 2: Download & Gap-Fill", "INFO")
         st.header("Phase 2: Download & Gap-Fill")
         
         downloaded_images = {}
@@ -1255,12 +1392,14 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                         month_statuses[month_name] = {'status': STATUS_COMPLETE, 'message': 'Cached'}
             
             if downloaded_images:
+                add_log_entry(f"RESUME: Found {len(downloaded_images)} cached downloads", "INFO")
                 st.info(f"🔄 Found {len(downloaded_images)} cached downloads")
                 for mn in sorted(downloaded_images.keys()):
                     st.write(f"🟢 **{mn}**: complete (cached)")
         
         # Restore previous month statuses (ONLY for months in current range that aren't downloaded)
         if resume and st.session_state.month_analysis_results:
+            add_log_entry(f"RESUME: Restoring {len(st.session_state.month_analysis_results)} month statuses from cache", "INFO")
             for month_name, status_info in st.session_state.month_analysis_results.items():
                 # Only consider months in current date range
                 if month_name not in current_range_months:
@@ -1279,6 +1418,7 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                             and m['month_name'] not in month_statuses]
         
         if months_to_process:
+            add_log_entry(f"Processing {len(months_to_process)} remaining months", "INFO")
             st.info(f"📥 {len(months_to_process)} months to process: {', '.join([m['month_name'] for m in months_to_process])}")
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -1455,194 +1595,321 @@ def process_timeseries(aoi, start_date, end_date, model, device,
 
 
 # =============================================================================
-# Band Statistics and PDF Report Generation
+# Comprehensive PDF Log Generation
 # =============================================================================
-def calculate_band_statistics(image_path, month_name):
+def generate_comprehensive_log_pdf():
     """
-    Calculate statistics (min, median, max, mean) for each band of an image.
-    Returns a dictionary with band statistics.
-    """
-    try:
-        with rasterio.open(image_path) as src:
-            stats = {
-                'month_name': month_name,
-                'bands': {}
-            }
-            
-            for band_idx, band_name in enumerate(SPECTRAL_BANDS, start=1):
-                band_data = src.read(band_idx)
-                # Exclude zeros and NaN for statistics
-                valid_data = band_data[(band_data != 0) & (~np.isnan(band_data))]
-                
-                if len(valid_data) > 0:
-                    stats['bands'][band_name] = {
-                        'min': float(np.min(valid_data)),
-                        'max': float(np.max(valid_data)),
-                        'mean': float(np.mean(valid_data)),
-                        'median': float(np.median(valid_data)),
-                        'std': float(np.std(valid_data))
-                    }
-                else:
-                    stats['bands'][band_name] = {
-                        'min': 0.0,
-                        'max': 0.0,
-                        'mean': 0.0,
-                        'median': 0.0,
-                        'std': 0.0
-                    }
-            
-            return stats
-    except Exception as e:
-        st.warning(f"Error calculating statistics for {month_name}: {e}")
-        return None
-
-
-def generate_band_statistics_pdf(valid_months, thumbnails):
-    """
-    Generate a PDF report with band statistics for all processed images.
-    Uses matplotlib for PDF generation (no external dependencies).
+    Generate a comprehensive PDF log with all processing details including:
+    - Summary page
+    - Monthly details with component images
+    - Patch validity analysis figure
+    - Change detection timing (colored map + binary images per month)
+    - Processing log with timestamps
+    
     Returns PDF bytes.
     """
     try:
         from matplotlib.backends.backend_pdf import PdfPages
         import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        
+        add_log_entry("Starting PDF log generation", "INFO")
         
         # Create PDF buffer
         buffer = BytesIO()
         
-        # Calculate statistics for each image
-        all_stats = []
-        month_names = sorted(valid_months.keys())
-        
-        for month_name in month_names:
-            image_path = valid_months[month_name]
-            stats = calculate_band_statistics(image_path, month_name)
-            if stats:
-                all_stats.append(stats)
-        
-        if not all_stats:
-            return None
-        
         with PdfPages(buffer) as pdf:
-            # Page 1: Title and Summary
+            # =================================================================
+            # PAGE 1: SUMMARY
+            # =================================================================
             fig, ax = plt.subplots(figsize=(11.69, 8.27))  # A4 landscape
             ax.axis('off')
             
             # Title
-            ax.text(0.5, 0.95, 'Sentinel-2 Band Statistics Report', 
-                   fontsize=20, fontweight='bold', ha='center', va='top',
+            ax.text(0.5, 0.95, 'Building Classification Processing Log', 
+                   fontsize=22, fontweight='bold', ha='center', va='top',
                    transform=ax.transAxes)
-            ax.text(0.5, 0.88, f'Generated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
-                   fontsize=12, ha='center', va='top', transform=ax.transAxes)
-            ax.text(0.5, 0.83, f'Total Images Analyzed: {len(all_stats)}',
-                   fontsize=12, ha='center', va='top', transform=ax.transAxes)
-            ax.text(0.5, 0.78, f'Months: {month_names[0]} to {month_names[-1]}',
+            ax.text(0.5, 0.89, f'Generated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
                    fontsize=12, ha='center', va='top', transform=ax.transAxes)
             
-            # Band list
-            ax.text(0.5, 0.70, 'Bands Analyzed:', fontsize=14, fontweight='bold',
-                   ha='center', va='top', transform=ax.transAxes)
-            bands_text = ', '.join(SPECTRAL_BANDS)
-            ax.text(0.5, 0.65, bands_text, fontsize=10, ha='center', va='top',
-                   transform=ax.transAxes)
+            # Processing configuration
+            config = st.session_state.get('processing_config', {})
+            if config:
+                y_pos = 0.80
+                ax.text(0.1, y_pos, 'Processing Configuration:', fontsize=14, fontweight='bold',
+                       va='top', transform=ax.transAxes)
+                y_pos -= 0.05
+                ax.text(0.1, y_pos, f"  • Date Range: {config.get('start_date', 'N/A')} to {config.get('end_date', 'N/A')}",
+                       fontsize=10, va='top', transform=ax.transAxes)
+                y_pos -= 0.04
+                ax.text(0.1, y_pos, f"  • Max Cloud %: {config.get('cloudy_pct', 'N/A')}",
+                       fontsize=10, va='top', transform=ax.transAxes)
+                y_pos -= 0.04
+                ax.text(0.1, y_pos, f"  • Patch Nodata %: 0 (fixed)",
+                       fontsize=10, va='top', transform=ax.transAxes)
+            
+            # Month statistics
+            month_analysis = st.session_state.get('month_analysis_results', {})
+            if month_analysis:
+                y_pos -= 0.06
+                ax.text(0.1, y_pos, 'Monthly Analysis Summary:', fontsize=14, fontweight='bold',
+                       va='top', transform=ax.transAxes)
+                
+                status_counts = {}
+                for ms in month_analysis.values():
+                    status = ms.get('status', 'unknown')
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                
+                y_pos -= 0.05
+                ax.text(0.1, y_pos, f"  • Total months analyzed: {len(month_analysis)}",
+                       fontsize=10, va='top', transform=ax.transAxes)
+                y_pos -= 0.04
+                ax.text(0.1, y_pos, f"  • Complete: {status_counts.get('complete', 0)}",
+                       fontsize=10, va='top', transform=ax.transAxes, color='green')
+                y_pos -= 0.04
+                ax.text(0.1, y_pos, f"  • Skipped: {status_counts.get('skipped', 0)}",
+                       fontsize=10, va='top', transform=ax.transAxes, color='orange')
+                y_pos -= 0.04
+                ax.text(0.1, y_pos, f"  • Rejected: {status_counts.get('rejected', 0)}",
+                       fontsize=10, va='top', transform=ax.transAxes, color='red')
+                y_pos -= 0.04
+                ax.text(0.1, y_pos, f"  • No Data: {status_counts.get('no_data', 0)}",
+                       fontsize=10, va='top', transform=ax.transAxes, color='gray')
+            
+            # Change detection summary
+            change_result = st.session_state.get('change_detection_result', {})
+            if change_result:
+                stats = change_result.get('stats', {})
+                y_pos -= 0.06
+                ax.text(0.1, y_pos, 'Change Detection Summary:', fontsize=14, fontweight='bold',
+                       va='top', transform=ax.transAxes)
+                y_pos -= 0.05
+                ax.text(0.1, y_pos, f"  • Change pixels: {stats.get('change_pixels', 0):,}",
+                       fontsize=10, va='top', transform=ax.transAxes)
+                y_pos -= 0.04
+                ax.text(0.1, y_pos, f"  • Total pixels: {stats.get('total_pixels', 0):,}",
+                       fontsize=10, va='top', transform=ax.transAxes)
+                y_pos -= 0.04
+                ax.text(0.1, y_pos, f"  • Change rate: {stats.get('change_percentage', 0):.4f}%",
+                       fontsize=10, va='top', transform=ax.transAxes)
             
             pdf.savefig(fig, bbox_inches='tight')
             plt.close(fig)
             
-            # Pages for each statistic type: MEAN, MEDIAN, MIN, MAX, STD
-            for stat_type, stat_title in [('mean', 'MEAN'), ('median', 'MEDIAN'), 
-                                           ('min', 'MIN'), ('max', 'MAX'), ('std', 'STD DEV')]:
-                fig, ax = plt.subplots(figsize=(11.69, 8.27))
-                ax.axis('off')
+            # =================================================================
+            # PAGES 2-N: MONTHLY DETAILS WITH COMPONENT IMAGES
+            # =================================================================
+            month_analysis = st.session_state.get('month_analysis_results', {})
+            image_counts = st.session_state.get('monthly_image_counts', {})
+            component_images = st.session_state.get('monthly_component_images', {})
+            
+            for month_name in sorted(month_analysis.keys()):
+                info = month_analysis[month_name]
+                status = info.get('status', 'unknown')
+                message = info.get('message', '')
+                img_count = image_counts.get(month_name, 0)
+                components = component_images.get(month_name, [])
                 
-                ax.text(0.5, 0.98, f'{stat_title} Values by Band', 
-                       fontsize=16, fontweight='bold', ha='center', va='top',
-                       transform=ax.transAxes)
+                # Determine color based on status
+                status_color = {'complete': 'green', 'skipped': 'orange', 
+                               'rejected': 'red', 'no_data': 'gray'}.get(status, 'black')
                 
-                # Create table data
-                col_labels = ['Band'] + [s['month_name'] for s in all_stats]
-                table_data = []
+                # Calculate how many rows we need for component images
+                n_components = len(components)
+                n_cols = 4
+                n_rows = max(1, (n_components + n_cols - 1) // n_cols)
                 
-                for band_name in SPECTRAL_BANDS:
-                    row = [band_name]
-                    for stats in all_stats:
-                        value = stats['bands'].get(band_name, {}).get(stat_type, 0)
-                        row.append(f'{value:.4f}')
-                    table_data.append(row)
+                # Create figure with subplots for component images
+                fig_height = 4 + n_rows * 2.5
+                fig = plt.figure(figsize=(11.69, min(fig_height, 8.27)))
                 
-                # Create table
-                table = ax.table(cellText=table_data, colLabels=col_labels,
-                                loc='center', cellLoc='center')
-                table.auto_set_font_size(False)
-                table.set_fontsize(7)
-                table.scale(1.2, 1.5)
+                # Header section
+                header_ax = fig.add_axes([0.05, 0.85, 0.9, 0.12])
+                header_ax.axis('off')
+                header_ax.text(0.5, 0.9, f'Month: {month_name}', fontsize=16, fontweight='bold',
+                              ha='center', va='top', transform=header_ax.transAxes)
+                header_ax.text(0.5, 0.5, f'Status: {status.upper()}', fontsize=14, 
+                              ha='center', va='top', transform=header_ax.transAxes, color=status_color)
+                header_ax.text(0.5, 0.2, f'Reason: {message}', fontsize=10,
+                              ha='center', va='top', transform=header_ax.transAxes)
+                header_ax.text(0.5, -0.1, f'Component Images: {img_count}', fontsize=10,
+                              ha='center', va='top', transform=header_ax.transAxes)
                 
-                # Style header
-                for j in range(len(col_labels)):
-                    table[(0, j)].set_facecolor('#4472C4')
-                    table[(0, j)].set_text_props(color='white', fontweight='bold')
-                
-                # Style band column
-                for i in range(1, len(SPECTRAL_BANDS) + 1):
-                    table[(i, 0)].set_facecolor('#D9E2F3')
-                    table[(i, 0)].set_text_props(fontweight='bold')
+                # Component images grid
+                if components:
+                    for idx, comp in enumerate(components[:12]):  # Max 12 images per page
+                        row = idx // n_cols
+                        col = idx % n_cols
+                        
+                        # Calculate position
+                        left = 0.05 + col * 0.24
+                        bottom = 0.7 - (row + 1) * 0.22
+                        width = 0.22
+                        height = 0.18
+                        
+                        if bottom < 0.05:
+                            break
+                        
+                        ax_img = fig.add_axes([left, bottom, width, height])
+                        ax_img.imshow(comp['rgb'])
+                        ax_img.set_title(comp['date'], fontsize=8)
+                        ax_img.axis('off')
                 
                 pdf.savefig(fig, bbox_inches='tight')
                 plt.close(fig)
             
-            # Detailed pages for each image
-            for stats in all_stats:
+            # =================================================================
+            # PAGE: PATCH VALIDITY ANALYSIS
+            # =================================================================
+            valid_mask = st.session_state.get('valid_patches_mask', None)
+            if valid_mask is not None:
                 fig, ax = plt.subplots(figsize=(11.69, 8.27))
-                ax.axis('off')
                 
-                ax.text(0.5, 0.98, f'Detailed Statistics: {stats["month_name"]}', 
-                       fontsize=16, fontweight='bold', ha='center', va='top',
-                       transform=ax.transAxes)
+                # Create colored validity map
+                im = ax.imshow(valid_mask, cmap='RdYlGn', vmin=0, vmax=1)
+                ax.set_title(f'Patch Validity Analysis\n({np.sum(valid_mask)} valid patches out of {valid_mask.size})', 
+                            fontsize=14, fontweight='bold')
+                ax.set_xlabel('Patch Column')
+                ax.set_ylabel('Patch Row')
                 
-                # Create detailed table
-                col_labels = ['Band', 'Min', 'Max', 'Mean', 'Median', 'Std Dev']
-                table_data = []
+                # Add colorbar
+                cbar = plt.colorbar(im, ax=ax, shrink=0.6)
+                cbar.set_ticks([0, 1])
+                cbar.set_ticklabels(['Invalid', 'Valid'])
                 
-                for band_name in SPECTRAL_BANDS:
-                    band_stats = stats['bands'].get(band_name, {})
-                    row = [
-                        band_name,
-                        f"{band_stats.get('min', 0):.6f}",
-                        f"{band_stats.get('max', 0):.6f}",
-                        f"{band_stats.get('mean', 0):.6f}",
-                        f"{band_stats.get('median', 0):.6f}",
-                        f"{band_stats.get('std', 0):.6f}"
-                    ]
-                    table_data.append(row)
-                
-                table = ax.table(cellText=table_data, colLabels=col_labels,
-                                loc='center', cellLoc='center')
-                table.auto_set_font_size(False)
-                table.set_fontsize(9)
-                table.scale(1.5, 1.8)
-                
-                # Style header
-                for j in range(len(col_labels)):
-                    table[(0, j)].set_facecolor('#1F4E79')
-                    table[(0, j)].set_text_props(color='white', fontweight='bold')
-                
-                # Style band column
-                for i in range(1, len(SPECTRAL_BANDS) + 1):
-                    table[(i, 0)].set_facecolor('#D6DCE5')
-                    table[(i, 0)].set_text_props(fontweight='bold')
+                # Add grid
+                ax.set_xticks(np.arange(-0.5, valid_mask.shape[1], 1), minor=True)
+                ax.set_yticks(np.arange(-0.5, valid_mask.shape[0], 1), minor=True)
+                ax.grid(which='minor', color='black', linestyle='-', linewidth=0.5)
                 
                 pdf.savefig(fig, bbox_inches='tight')
                 plt.close(fig)
+            
+            # =================================================================
+            # PAGE: CHANGE DETECTION - COLORED TIMING MAP (Option B)
+            # =================================================================
+            change_timing = st.session_state.get('change_timing_map', None)
+            change_result = st.session_state.get('change_detection_result', {})
+            
+            if change_timing is not None and change_result:
+                stats = change_result.get('stats', {})
+                sorted_months = stats.get('months', [])
+                
+                # Create colored timing map
+                fig, ax = plt.subplots(figsize=(11.69, 8.27))
+                
+                # Create a custom colormap for months
+                n_months = len(sorted_months)
+                if n_months > 1:
+                    # Create distinct colors for each month
+                    colors = plt.cm.tab20(np.linspace(0, 1, n_months))
+                    # First color (index 0) should be for "no change" - make it black
+                    colors_with_black = np.vstack([[0, 0, 0, 1], colors])
+                    cmap = mcolors.ListedColormap(colors_with_black)
+                    
+                    im = ax.imshow(change_timing, cmap=cmap, vmin=0, vmax=n_months)
+                    ax.set_title('Change Detection Timing Map\n(Color = Month of Transition)', 
+                                fontsize=14, fontweight='bold')
+                    
+                    # Create legend
+                    legend_labels = ['No Change'] + sorted_months[1:]  # Skip first month
+                    legend_colors = [colors_with_black[0]] + [colors_with_black[i+1] for i in range(n_months-1)]
+                    
+                    # Add legend with patches
+                    from matplotlib.patches import Patch
+                    legend_elements = [Patch(facecolor=legend_colors[i], label=legend_labels[i]) 
+                                      for i in range(min(len(legend_labels), 15))]  # Max 15 in legend
+                    ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.02, 1),
+                             fontsize=8, title='Transition Month')
+                else:
+                    ax.imshow(change_timing, cmap='gray')
+                    ax.set_title('Change Detection Timing Map', fontsize=14, fontweight='bold')
+                
+                ax.axis('off')
+                plt.tight_layout()
+                pdf.savefig(fig, bbox_inches='tight')
+                plt.close(fig)
+                
+                # =============================================================
+                # PAGES: BINARY IMAGES PER TRANSITION MONTH (Option A)
+                # =============================================================
+                transition_by_month = stats.get('transition_by_month', {})
+                
+                for month_idx, month in enumerate(sorted_months[1:], start=1):
+                    count = transition_by_month.get(month, 0)
+                    if count == 0:
+                        continue
+                    
+                    # Create binary mask for this month
+                    binary_mask = (change_timing == month_idx).astype(np.uint8) * 255
+                    
+                    fig, ax = plt.subplots(figsize=(11.69, 8.27))
+                    ax.imshow(binary_mask, cmap='gray', vmin=0, vmax=255)
+                    ax.set_title(f'Changes in {month}\n({count:,} pixels transitioned)', 
+                                fontsize=14, fontweight='bold')
+                    ax.axis('off')
+                    
+                    # Add text info
+                    fig.text(0.5, 0.02, 'White = Pixel changed to building in this month | Black = No change',
+                            ha='center', fontsize=10)
+                    
+                    pdf.savefig(fig, bbox_inches='tight')
+                    plt.close(fig)
+            
+            # =================================================================
+            # PAGE: PROCESSING LOG
+            # =================================================================
+            processing_log = st.session_state.get('processing_log', [])
+            if processing_log:
+                # Split log into pages of ~40 entries each
+                entries_per_page = 40
+                n_pages = (len(processing_log) + entries_per_page - 1) // entries_per_page
+                
+                for page_num in range(n_pages):
+                    start_idx = page_num * entries_per_page
+                    end_idx = min(start_idx + entries_per_page, len(processing_log))
+                    page_entries = processing_log[start_idx:end_idx]
+                    
+                    fig, ax = plt.subplots(figsize=(11.69, 8.27))
+                    ax.axis('off')
+                    
+                    ax.text(0.5, 0.98, f'Processing Log (Page {page_num + 1}/{n_pages})', 
+                           fontsize=14, fontweight='bold', ha='center', va='top',
+                           transform=ax.transAxes)
+                    
+                    y_pos = 0.93
+                    for entry in page_entries:
+                        timestamp = entry.get('timestamp', '')
+                        level = entry.get('level', 'INFO')
+                        message = entry.get('message', '')
+                        
+                        # Color based on level
+                        color = {'INFO': 'black', 'WARNING': 'orange', 'ERROR': 'red'}.get(level, 'black')
+                        
+                        # Truncate long messages
+                        if len(message) > 80:
+                            message = message[:77] + '...'
+                        
+                        ax.text(0.02, y_pos, f'[{timestamp}] [{level}] {message}',
+                               fontsize=7, va='top', transform=ax.transAxes, color=color,
+                               family='monospace')
+                        y_pos -= 0.022
+                        
+                        if y_pos < 0.02:
+                            break
+                    
+                    pdf.savefig(fig, bbox_inches='tight')
+                    plt.close(fig)
         
         buffer.seek(0)
+        add_log_entry("PDF log generation complete", "INFO")
         return buffer.getvalue()
         
     except Exception as e:
-        st.error(f"Error generating PDF: {e}")
+        add_log_entry(f"Error generating PDF log: {e}", "ERROR")
         import traceback
-        st.error(traceback.format_exc())
+        add_log_entry(traceback.format_exc(), "ERROR")
         return None
-
 
 
 # =============================================================================
@@ -1671,11 +1938,16 @@ def analyze_building_transition(probability_maps, non_building_thr=0.2, building
         change_mask: Binary array where 1 = change detected
         stats: Dictionary with statistics
     """
+    add_log_entry(f"Starting change detection analysis", "INFO")
+    
     # Sort months chronologically
     sorted_months = sorted(probability_maps.keys())
     
     if len(sorted_months) < (non_building_duration + building_duration):
-        return None, {"error": f"Need at least {non_building_duration + building_duration} months, got {len(sorted_months)}"}
+        add_log_entry(f"Not enough months for change detection", "ERROR")
+        return None, None, {"error": f"Need at least {non_building_duration + building_duration} months, got {len(sorted_months)}"}
+    
+    add_log_entry(f"Analyzing {len(sorted_months)} months: {sorted_months[0]} to {sorted_months[-1]}", "INFO")
     
     # Stack probability maps into 3D array (time, height, width)
     first_map = probability_maps[sorted_months[0]]
@@ -1688,6 +1960,8 @@ def analyze_building_transition(probability_maps, non_building_thr=0.2, building
     
     # Initialize results
     results = np.zeros((height, width), dtype=np.uint8)
+    # NEW: Track which month each pixel transitioned (0 = no transition, 1-N = month index)
+    transition_timing = np.zeros((height, width), dtype=np.int16)
     
     # Process each pixel
     for y in range(height):
@@ -1736,11 +2010,24 @@ def analyze_building_transition(probability_maps, non_building_thr=0.2, building
                 if (nb_duration >= non_building_duration and 
                     b_duration >= building_duration):
                     results[y, x] = 1
+                    transition_timing[y, x] = transition_point  # Store the month index
     
     # Calculate statistics
     change_pixels = np.sum(results == 1)
     total_pixels = np.sum(data[0] > 0)  # Count non-zero pixels
     change_percentage = (change_pixels / total_pixels * 100) if total_pixels > 0 else 0
+    
+    # Calculate per-month transition statistics
+    transition_by_month = {}
+    for i, month in enumerate(sorted_months):
+        if i > 0:  # Skip first month (can't transition TO first month)
+            count = np.sum(transition_timing == i)
+            transition_by_month[month] = int(count)
+    
+    add_log_entry(f"Change detection complete: {change_pixels} pixels changed ({change_percentage:.2f}%)", "INFO")
+    for month, count in transition_by_month.items():
+        if count > 0:
+            add_log_entry(f"  - {month}: {count} pixels transitioned", "INFO")
     
     stats = {
         'change_pixels': int(change_pixels),
@@ -1749,10 +2036,14 @@ def analyze_building_transition(probability_maps, non_building_thr=0.2, building
         'n_months': n_times,
         'months': sorted_months,
         'first_month': sorted_months[0],
-        'last_month': sorted_months[-1]
+        'last_month': sorted_months[-1],
+        'transition_by_month': transition_by_month
     }
     
-    return results, stats
+    # Store timing map in session state for PDF generation
+    st.session_state.change_timing_map = transition_timing
+    
+    return results, transition_timing, stats
 
 
 def generate_rgb_from_sentinel(image_path, max_size=None):
@@ -1803,24 +2094,24 @@ def display_thumbnails(thumbnails, valid_months=None):
     if not thumbnails:
         return
     
-    # Add PDF download button at the top
+    # Add Comprehensive Log PDF download button at the top
     if valid_months:
-        st.subheader("📊 Band Statistics Report")
+        st.subheader("📋 Processing Log")
         col1, col2 = st.columns([1, 3])
         with col1:
-            if st.button("📄 Generate PDF Report", type="primary"):
-                with st.spinner("Generating PDF report with band statistics..."):
-                    pdf_bytes = generate_band_statistics_pdf(valid_months, thumbnails)
+            if st.button("📄 Generate Log PDF", type="primary"):
+                with st.spinner("Generating comprehensive processing log PDF..."):
+                    pdf_bytes = generate_comprehensive_log_pdf()
                     if pdf_bytes:
-                        st.session_state.pdf_report = pdf_bytes
-                        st.success("✅ PDF report generated!")
+                        st.session_state.log_pdf_bytes = pdf_bytes
+                        st.success("✅ Log PDF generated!")
         
         with col2:
-            if 'pdf_report' in st.session_state and st.session_state.pdf_report:
+            if st.session_state.get('log_pdf_bytes'):
                 st.download_button(
-                    label="⬇️ Download Band Statistics Report (PDF)",
-                    data=st.session_state.pdf_report,
-                    file_name=f"band_statistics_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    label="⬇️ Download Processing Log (PDF)",
+                    data=st.session_state.log_pdf_bytes,
+                    file_name=f"processing_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
                     mime="application/pdf"
                 )
         
@@ -1937,14 +2228,8 @@ def main_classification_tab():
         help="GEE: Filter images by CLOUDY_PIXEL_PERCENTAGE metadata before cloud masking",
         disabled=st.session_state.processing_in_progress
     )
-    nodata_pct = st.sidebar.slider(
-        "Patch Nodata % (Python)", 0, 50, 0, 1,
-        help="""AFTER download: Each 224x224 patch is checked for zeros/NaN.
-        If a patch has more than this % of zeros, that patch is considered invalid.
-        Months with missing patches (compared to the best month) are EXCLUDED.
-        Default 0% means only fully valid patches are used.""",
-        disabled=st.session_state.processing_in_progress
-    )
+    # Nodata % is now fixed at 0 (removed slider per user request)
+    nodata_pct = 0
     
     # Cache Status
     st.sidebar.header("🗂️ Cache Status")
@@ -1975,7 +2260,9 @@ def main_classification_tab():
                     'valid_patches_mask', 'valid_months', 'current_temp_dir', 'month_analysis_results',
                     'failed_downloads', 'analysis_complete', 'download_complete',
                     'processing_params', 'processing_config', 'pdf_report',
-                    'probability_maps', 'change_detection_result']:
+                    'probability_maps', 'change_detection_result',
+                    'processing_log', 'monthly_component_images', 'monthly_image_counts',
+                    'change_timing_map', 'log_pdf_bytes']:
             if key in st.session_state:
                 if isinstance(st.session_state[key], dict):
                     st.session_state[key] = {}
@@ -1985,11 +2272,13 @@ def main_classification_tab():
                     st.session_state[key] = None
         st.session_state.processing_complete = False
         st.session_state.processing_in_progress = False
+        clear_log()
         st.rerun()
     
     # Stop processing button
     if st.session_state.processing_in_progress:
         if st.sidebar.button("🛑 Stop Processing", type="primary"):
+            add_log_entry("Processing stopped by user", "WARNING")
             st.session_state.processing_in_progress = False
             st.session_state.processing_config = None
             st.warning("⚠️ Processing stopped. You can resume later.")
@@ -2371,7 +2660,7 @@ def change_detection_tab():
         if st.button("🔍 Run Change Detection", type="primary", use_container_width=True):
             with st.spinner("Analyzing building transitions across time series..."):
                 # Run change detection
-                change_mask, stats = analyze_building_transition(
+                change_mask, timing_map, stats = analyze_building_transition(
                     st.session_state.probability_maps,
                     non_building_thr=non_building_thr_val,
                     building_thr=building_thr_val,
@@ -2382,6 +2671,7 @@ def change_detection_tab():
                 if change_mask is not None:
                     st.session_state.change_detection_result = {
                         'mask': change_mask,
+                        'timing_map': timing_map,
                         'stats': stats,
                         'params': {
                             'non_building_thr': non_building_thr_val,
@@ -2393,7 +2683,7 @@ def change_detection_tab():
                     st.success("✅ Change detection completed!")
                     st.rerun()
                 else:
-                    st.error(f"❌ Change detection failed: {stats.get('error', 'Unknown error')}")
+                    st.error(f"❌ Change detection failed: {stats.get('error', 'Unknown error') if stats else 'Unknown error'}")
     
     # =================================================================
     # DISPLAY RESULTS
@@ -2415,6 +2705,37 @@ def change_detection_tab():
         col4.metric("Months Analyzed", stats['n_months'])
         
         st.info(f"📅 Time range: **{stats['first_month']}** → **{stats['last_month']}**")
+        
+        # Display transition statistics by month
+        transition_by_month = stats.get('transition_by_month', {})
+        if transition_by_month:
+            with st.expander("📊 Transitions by Month", expanded=False):
+                for month, count in transition_by_month.items():
+                    if count > 0:
+                        st.write(f"  • **{month}**: {count:,} pixels transitioned")
+        
+        # =================================================================
+        # LOG PDF DOWNLOAD
+        # =================================================================
+        st.subheader("📋 Processing Log")
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            if st.button("📄 Generate Log PDF", type="primary", key="cd_log_btn"):
+                with st.spinner("Generating comprehensive processing log PDF..."):
+                    pdf_bytes = generate_comprehensive_log_pdf()
+                    if pdf_bytes:
+                        st.session_state.log_pdf_bytes = pdf_bytes
+                        st.success("✅ Log PDF generated!")
+        
+        with col2:
+            if st.session_state.get('log_pdf_bytes'):
+                st.download_button(
+                    label="⬇️ Download Processing Log (PDF)",
+                    data=st.session_state.log_pdf_bytes,
+                    file_name=f"processing_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    mime="application/pdf",
+                    key="cd_log_download"
+                )
         
         # =================================================================
         # VISUALIZATION
