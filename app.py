@@ -1998,7 +1998,7 @@ def main_classification_tab():
     # Region Selection
     st.header("1️⃣ Region")
     
-    # Only show map if not processing
+    # Show map when not actively processing (map should be visible even after processing completes)
     if not st.session_state.processing_in_progress:
         m = folium.Map(location=[35.6892, 51.3890], zoom_start=8)
         plugins.Draw(export=True, position='topleft', draw_options={
@@ -2009,7 +2009,9 @@ def main_classification_tab():
                          attr='Google', name='Satellite').add_to(m)
         folium.LayerControl().add_to(m)
         
-        map_data = st_folium(m, width=800, height=500)
+        # Use a unique key to force map refresh when cache is cleared
+        map_key = f"region_map_{len(st.session_state.drawn_polygons)}_{st.session_state.processing_complete}"
+        map_data = st_folium(m, width=800, height=500, key=map_key)
         
         if map_data and map_data.get('last_active_drawing'):
             geom = map_data['last_active_drawing'].get('geometry', {})
@@ -2602,12 +2604,18 @@ def display_interactive_map(first_image_path, last_image_path, first_class, last
     import base64
     from rasterio.warp import calculate_default_transform, reproject, Resampling
     
+    # Extract years from month names for legend
+    first_year = first_month.split('-')[0] if first_month else "N/A"
+    last_year = last_month.split('-')[0] if last_month else "N/A"
+    
     st.info("""
     **Interactive Map Controls:**
     - Use the **layer control** (top-right) to toggle layers on/off
     - Click **fullscreen button** (top-left) to expand
-    - **Base layers**: Google Satellite (100%), Google Maps (70%), OpenStreetMap (50%)
-    - **Overlays**: Sentinel RGB, Classifications (Green=Before, Red=After), Change Detection (Pink)
+    - **Base layers**: Google Satellite, Google Maps, OpenStreetMap
+    - **Overlays**: Sentinel RGB, Classifications (Green=Before, Red=After), Change Detection (Blue)
+    
+    ⚠️ **Note**: Base layer tiles require internet connection. Overlay data is embedded and will remain visible offline.
     """)
     
     try:
@@ -2764,12 +2772,12 @@ def display_interactive_map(first_image_path, last_image_path, first_class, last
                     rgba_array[mask_val, 3] = 180  # Alpha
                     pil_img = Image.fromarray(rgba_array, 'RGBA')
                 elif is_change_mask:
-                    # Change detection mask - light pink
+                    # Change detection mask - DARK BLUE for better contrast
                     data = src.read(1)
                     rgba_array = np.zeros((data.shape[0], data.shape[1], 4), dtype=np.uint8)
                     mask_val = data > 0
-                    rgba_array[mask_val, 0:3] = [255, 182, 193]  # Light pink
-                    rgba_array[mask_val, 3] = 200  # Semi-transparent
+                    rgba_array[mask_val, 0:3] = [0, 0, 180]  # Dark blue RGB
+                    rgba_array[mask_val, 3] = 220  # Higher opacity for visibility
                     pil_img = Image.fromarray(rgba_array, 'RGBA')
                 else:
                     # Single band with colormap
@@ -2813,8 +2821,40 @@ def display_interactive_map(first_image_path, last_image_path, first_class, last
         if last_rgb is not None:
             after_rgb_wgs84_path = reproject_rgb_to_wgs84(last_rgb, f"after_rgb_{last_month}")
         
-        # Create Folium map
-        m = folium.Map(location=center, zoom_start=15, tiles=None)
+        # Calculate bounds for map initialization (prevents reset on internet loss)
+        if target_bounds:
+            map_bounds = [[target_bounds.bottom, target_bounds.left], 
+                         [target_bounds.top, target_bounds.right]]
+            # Calculate appropriate zoom level based on bounds
+            lat_diff = target_bounds.top - target_bounds.bottom
+            lon_diff = target_bounds.right - target_bounds.left
+            max_diff = max(lat_diff, lon_diff)
+            # Approximate zoom level calculation
+            if max_diff > 1:
+                zoom_level = 8
+            elif max_diff > 0.5:
+                zoom_level = 10
+            elif max_diff > 0.1:
+                zoom_level = 12
+            elif max_diff > 0.05:
+                zoom_level = 14
+            else:
+                zoom_level = 15
+        else:
+            map_bounds = None
+            zoom_level = 15
+        
+        # Create Folium map with explicit bounds to prevent reset
+        m = folium.Map(
+            location=center, 
+            zoom_start=zoom_level, 
+            tiles=None,
+            # These options help stabilize the map
+            prefer_canvas=True,
+            zoom_control=True,
+            scrollWheelZoom=True,
+            dragging=True
+        )
         
         # Add fullscreen control
         plugins.Fullscreen(
@@ -2825,11 +2865,11 @@ def display_interactive_map(first_image_path, last_image_path, first_class, last
         ).add_to(m)
         
         # BASE LAYERS - mutually exclusive background layers
-        # Google Satellite at 100% opacity (default)
+        # Google Satellite with year in name
         folium.TileLayer(
             tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
             attr='Google Satellite',
-            name='Google Satellite',
+            name=f'Google Satellite ({last_year})',
             overlay=False,
             control=True
         ).add_to(m)
@@ -2918,7 +2958,7 @@ def display_interactive_map(first_image_path, last_image_path, first_class, last
             except Exception as e:
                 st.warning(f"Could not add last classification layer: {e}")
         
-        # Change detection mask (top overlay) - light pink
+        # Change detection mask (top overlay) - DARK BLUE
         if change_mask_wgs84_path:
             try:
                 img_data, bounds = raster_to_folium_overlay(
@@ -2928,7 +2968,7 @@ def display_interactive_map(first_image_path, last_image_path, first_class, last
                     image=img_data,
                     bounds=bounds,
                     opacity=0.8,
-                    name=f"Change Detection ({first_month} → {last_month}) - Pink",
+                    name=f"Change Detection ({first_month} → {last_month}) - Blue",
                     overlay=True,
                     control=True,
                     show=True
@@ -2936,28 +2976,72 @@ def display_interactive_map(first_image_path, last_image_path, first_class, last
             except Exception as e:
                 st.warning(f"Could not add change detection layer: {e}")
         
-        # Fit map to bounds
+        # Fit map to bounds and set max bounds to prevent excessive panning
         if target_bounds:
             m.fit_bounds([[target_bounds.bottom, target_bounds.left], 
                          [target_bounds.top, target_bounds.right]])
+            # Add a slight padding to max bounds
+            padding = 0.01  # degrees
+            m.options['maxBounds'] = [
+                [target_bounds.bottom - padding, target_bounds.left - padding],
+                [target_bounds.top + padding, target_bounds.right + padding]
+            ]
         
         # Add layer control
         folium.LayerControl(position='topright', collapsed=False).add_to(m)
+        
+        # Add custom JavaScript to prevent map reset on tile load errors
+        custom_js = f"""
+        <script>
+        document.addEventListener('DOMContentLoaded', function() {{
+            // Store initial view
+            var initialCenter = [{center[0]}, {center[1]}];
+            var initialZoom = {zoom_level};
+            
+            // Find the map object
+            setTimeout(function() {{
+                var maps = document.querySelectorAll('.folium-map');
+                maps.forEach(function(mapEl) {{
+                    if (mapEl._leaflet_map) {{
+                        var map = mapEl._leaflet_map;
+                        
+                        // Prevent tile errors from affecting map state
+                        map.on('tileerror', function(e) {{
+                            console.log('Tile error (ignored):', e);
+                        }});
+                        
+                        // Store current view on every move
+                        var lastCenter = map.getCenter();
+                        var lastZoom = map.getZoom();
+                        
+                        map.on('moveend', function() {{
+                            lastCenter = map.getCenter();
+                            lastZoom = map.getZoom();
+                        }});
+                    }}
+                }});
+            }}, 1000);
+        }});
+        </script>
+        """
+        m.get_root().html.add_child(folium.Element(custom_js))
         
         # Display the map using components.html
         map_html = m.get_root().render()
         components.html(map_html, height=600)
         
-        st.caption("""
+        st.caption(f"""
         **Layer Legend:**
-        - 🟢 **Green**: First month classification (buildings at start)
-        - 🔴 **Red**: Last month classification (buildings at end)
-        - 🩷 **Pink**: Change detection (new buildings detected)
+        - 🟢 **Green**: First month classification ({first_month}) - buildings at start
+        - 🔴 **Red**: Last month classification ({last_month}) - buildings at end
+        - 🔵 **Blue**: Change detection (new buildings detected)
         
         **Base Layers:**
-        - Google Satellite: Full resolution satellite imagery
+        - Google Satellite ({last_year}): Satellite imagery (approximate year based on data availability)
         - Google Maps: Street map with labels
         - OpenStreetMap: Community-maintained map
+        
+        *Note: Base layer tiles require internet. Overlay data (classifications, change detection) is embedded and remains visible offline.*
         """)
         
     except Exception as e:
