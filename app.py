@@ -97,7 +97,7 @@ MIN_BAND_FILE_SIZE = 10000
 MIN_MULTIBAND_FILE_SIZE = 100000
 
 # Cloud masking thresholds (from JS)
-CLOUD_PROB_THRESHOLD = 65
+CLOUD_PROB_THRESHOLD = 50
 CDI_THRESHOLD = -0.5
 
 # Gap-filling threshold
