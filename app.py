@@ -97,7 +97,7 @@ MIN_BAND_FILE_SIZE = 10000
 MIN_MULTIBAND_FILE_SIZE = 100000
 
 # Cloud masking thresholds (from JS)
-CLOUD_PROB_THRESHOLD = 65
+CLOUD_PROB_THRESHOLD = 50
 CDI_THRESHOLD = -0.5
 
 # Gap-filling threshold
@@ -176,28 +176,6 @@ if 'change_timing_map' not in st.session_state:
     st.session_state.change_timing_map = None  # Array showing which month each pixel changed
 if 'log_pdf_bytes' not in st.session_state:
     st.session_state.log_pdf_bytes = None
-# NEW: For map view persistence (prevents reset on internet loss)
-if 'map_center' not in st.session_state:
-    st.session_state.map_center = [35.6892, 51.3890]  # Default center (Tehran)
-if 'map_zoom' not in st.session_state:
-    st.session_state.map_zoom = 8
-if 'map_last_bounds' not in st.session_state:
-    st.session_state.map_last_bounds = None
-# NEW: Store per-month patch validity masks for PDF logging
-if 'monthly_patch_validity' not in st.session_state:
-    st.session_state.monthly_patch_validity = {}  # {month_name: validity_mask}
-# NEW: For map view persistence (prevents reset on internet loss)
-if 'map_center' not in st.session_state:
-    st.session_state.map_center = [35.6892, 51.3890]  # Default center (Tehran)
-if 'map_zoom' not in st.session_state:
-    st.session_state.map_zoom = 8
-if 'map_bounds' not in st.session_state:
-    st.session_state.map_bounds = None
-# NEW: For Sentinel-2 preview imagery
-if 'sentinel_preview_start' not in st.session_state:
-    st.session_state.sentinel_preview_start = None
-if 'sentinel_preview_end' not in st.session_state:
-    st.session_state.sentinel_preview_end = None
 
 
 # =============================================================================
@@ -239,7 +217,6 @@ def clear_log():
     st.session_state.monthly_image_counts = {}
     st.session_state.change_timing_map = None
     st.session_state.log_pdf_bytes = None
-    st.session_state.monthly_patch_validity = {}
 
 
 # =============================================================================
@@ -382,8 +359,6 @@ def get_utm_zone(longitude):
 def get_utm_epsg(longitude, latitude):
     zone_number = get_utm_zone(longitude)
     return f"EPSG:326{zone_number:02d}" if latitude >= 0 else f"EPSG:327{zone_number:02d}"
-
-
 
 
 # =============================================================================
@@ -1043,9 +1018,6 @@ def find_common_valid_patches(downloaded_images, nodata_threshold_percent=0):
     if len(month_validity_masks) == 0:
         st.error("❌ Could not analyze any months!")
         return None, None, None
-    
-    # Store per-month validity masks for PDF logging
-    st.session_state.monthly_patch_validity = month_validity_masks.copy()
     
     # =========================================================================
     # STEP 4: Find the month with MAXIMUM valid patches (reference)
@@ -1730,7 +1702,6 @@ def generate_comprehensive_log_pdf():
             month_analysis = st.session_state.get('month_analysis_results', {})
             image_counts = st.session_state.get('monthly_image_counts', {})
             component_images = st.session_state.get('monthly_component_images', {})
-            monthly_patch_validity = st.session_state.get('monthly_patch_validity', {})
             
             for month_name in sorted(month_analysis.keys()):
                 info = month_analysis[month_name]
@@ -1738,7 +1709,6 @@ def generate_comprehensive_log_pdf():
                 message = info.get('message', '')
                 img_count = image_counts.get(month_name, 0)
                 components = component_images.get(month_name, [])
-                patch_validity = monthly_patch_validity.get(month_name, None)
                 
                 # Determine color based on status
                 status_color = {'complete': 'green', 'skipped': 'orange', 
@@ -1787,46 +1757,6 @@ def generate_comprehensive_log_pdf():
                 
                 pdf.savefig(fig, bbox_inches='tight')
                 plt.close(fig)
-                
-                # =============================================================
-                # PAGE: PATCH VALIDITY FOR THIS MONTH
-                # =============================================================
-                if patch_validity is not None:
-                    fig, ax = plt.subplots(figsize=(11.69, 8.27))
-                    
-                    # Create colored validity map (green=valid, red=invalid)
-                    im = ax.imshow(patch_validity, cmap='RdYlGn', vmin=0, vmax=1)
-                    
-                    n_valid = np.sum(patch_validity)
-                    n_total = patch_validity.size
-                    n_invalid = n_total - n_valid
-                    
-                    ax.set_title(f'Patch Validity Analysis - {month_name}\n'
-                                f'({n_valid} valid / {n_invalid} invalid out of {n_total} patches)', 
-                                fontsize=14, fontweight='bold')
-                    ax.set_xlabel('Patch Column', fontsize=10)
-                    ax.set_ylabel('Patch Row', fontsize=10)
-                    
-                    # Add colorbar
-                    cbar = plt.colorbar(im, ax=ax, shrink=0.6)
-                    cbar.set_ticks([0, 1])
-                    cbar.set_ticklabels(['Invalid', 'Valid'])
-                    
-                    # Add grid lines
-                    ax.set_xticks(np.arange(-0.5, patch_validity.shape[1], 1), minor=True)
-                    ax.set_yticks(np.arange(-0.5, patch_validity.shape[0], 1), minor=True)
-                    ax.grid(which='minor', color='black', linestyle='-', linewidth=0.5)
-                    
-                    # Add tick labels for patch indices
-                    ax.set_xticks(np.arange(patch_validity.shape[1]))
-                    ax.set_yticks(np.arange(patch_validity.shape[0]))
-                    
-                    # Add status indicator
-                    fig.text(0.5, 0.02, f'Status: {status.upper()} - {message}', 
-                            ha='center', fontsize=10, color=status_color, fontweight='bold')
-                    
-                    pdf.savefig(fig, bbox_inches='tight')
-                    plt.close(fig)
             
             # =================================================================
             # PAGE: PATCH VALIDITY ANALYSIS
@@ -2332,7 +2262,7 @@ def main_classification_tab():
                     'processing_params', 'processing_config', 'pdf_report',
                     'probability_maps', 'change_detection_result',
                     'processing_log', 'monthly_component_images', 'monthly_image_counts',
-                    'change_timing_map', 'log_pdf_bytes', 'monthly_patch_validity']:
+                    'change_timing_map', 'log_pdf_bytes']:
             if key in st.session_state:
                 if isinstance(st.session_state[key], dict):
                     st.session_state[key] = {}
@@ -2359,112 +2289,42 @@ def main_classification_tab():
     
     # Show map when not actively processing (map should be visible even after processing completes)
     if not st.session_state.processing_in_progress:
-        st.info("""
-        **🗺️ Map Controls:** Use rectangle or polygon tools (top-left) to draw a region, then click **Save Region**
-        """)
+        m = folium.Map(location=[35.6892, 51.3890], zoom_start=8)
+        plugins.Draw(export=True, position='topleft', draw_options={
+            'polyline': False, 'rectangle': True, 'polygon': True,
+            'circle': False, 'marker': False, 'circlemarker': False
+        }).add_to(m)
+        folium.TileLayer(tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+                         attr='Google', name='Satellite').add_to(m)
+        folium.LayerControl().add_to(m)
         
-        # Create folium map with saved polygons displayed
-        m = folium.Map(
-            location=st.session_state.map_center, 
-            zoom_start=st.session_state.map_zoom,
-            tiles=None
-        )
+        # Use a unique key to force map refresh when cache is cleared
+        map_key = f"region_map_{len(st.session_state.drawn_polygons)}_{st.session_state.processing_complete}"
+        map_data = st_folium(m, width=800, height=500, key=map_key)
         
-        # Add tile layers
-        folium.TileLayer(
-            tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
-            attr='Google Satellite',
-            name='Google Satellite'
-        ).add_to(m)
-        
-        folium.TileLayer(
-            tiles='https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',
-            attr='Google Maps',
-            name='Google Maps'
-        ).add_to(m)
-        
-        folium.TileLayer(
-            tiles='OpenStreetMap',
-            name='OpenStreetMap'
-        ).add_to(m)
-        
-        # Add saved polygons to map
-        for i, poly in enumerate(st.session_state.drawn_polygons):
-            coords = [[c[1], c[0]] for c in poly.exterior.coords]  # Convert to [lat, lng]
-            area_km2 = poly.area * 111 * 111
-            folium.Polygon(
-                locations=coords,
-                color='#0066ff',
-                weight=3,
-                fill=True,
-                fill_color='#0066ff',
-                fill_opacity=0.2,
-                popup=f'Region {i+1}: ~{area_km2:.2f} km²',
-                tooltip=f'Region {i+1}: ~{area_km2:.2f} km²'
-            ).add_to(m)
-        
-        # Add draw control
-        plugins.Draw(
-            export=True, 
-            position='topleft', 
-            draw_options={
-                'polyline': False, 
-                'rectangle': True, 
-                'polygon': True,
-                'circle': False, 
-                'marker': False, 
-                'circlemarker': False
-            }
-        ).add_to(m)
-        
-        # Add layer control
-        folium.LayerControl(position='topright').add_to(m)
-        
-        # Display map
-        map_key = "main_map"
-        map_data = st_folium(m, width=800, height=500, key=map_key, returned_objects=["last_active_drawing", "center", "zoom"])
-        
-        # Update map center/zoom from user interaction
-        if map_data:
-            if map_data.get('center'):
-                st.session_state.map_center = [map_data['center']['lat'], map_data['center']['lng']]
-            if map_data.get('zoom'):
-                st.session_state.map_zoom = map_data['zoom']
-        
-        # Capture drawn polygon
         if map_data and map_data.get('last_active_drawing'):
             geom = map_data['last_active_drawing'].get('geometry', {})
             if geom.get('type') == 'Polygon':
-                coords = geom['coordinates'][0]
-                new_polygon = Polygon(coords)
-                area_km2 = new_polygon.area * 111 * 111
-                st.session_state.last_drawn_polygon = new_polygon
-                st.success(f"✅ Region drawn! Area: ~{area_km2:.2f} km²")
+                st.session_state.last_drawn_polygon = Polygon(geom['coordinates'][0])
+                st.success(f"✅ Region selected")
         
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("💾 Save Region", type="primary"):
-                if st.session_state.last_drawn_polygon:
-                    # Check if not already saved
-                    is_duplicate = False
-                    for existing in st.session_state.drawn_polygons:
-                        if existing.equals(st.session_state.last_drawn_polygon):
-                            is_duplicate = True
-                            break
-                    
-                    if not is_duplicate:
-                        st.session_state.drawn_polygons.append(st.session_state.last_drawn_polygon)
-                        st.success("✅ Region saved!")
-                        st.rerun()
-                    else:
-                        st.warning("⚠️ This region is already saved")
-                else:
-                    st.warning("⚠️ Draw a region first")
-        
-        with col2:
+        if st.button("💾 Save Region"):
             if st.session_state.last_drawn_polygon:
-                area = st.session_state.last_drawn_polygon.area * 111 * 111
-                st.info(f"📐 Current region: ~{area:.2f} km²")
+                # Check if not already saved
+                is_duplicate = False
+                for existing in st.session_state.drawn_polygons:
+                    if existing.equals(st.session_state.last_drawn_polygon):
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    st.session_state.drawn_polygons.append(st.session_state.last_drawn_polygon)
+                    st.success("✅ Region saved!")
+                    st.rerun()
+                else:
+                    st.warning("⚠️ This region is already saved")
+            else:
+                st.warning("⚠️ Draw a region first")
     else:
         st.info("🔒 Map is locked during processing")
     
