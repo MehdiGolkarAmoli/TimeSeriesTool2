@@ -384,461 +384,6 @@ def get_utm_epsg(longitude, latitude):
     return f"EPSG:326{zone_number:02d}" if latitude >= 0 else f"EPSG:327{zone_number:02d}"
 
 
-def create_robust_region_map(saved_polygons=None):
-    """
-    Create a robust region selection map with:
-    1. View state persistence (survives internet drops)
-    2. Dynamic area display while drawing
-    3. Tile error handling
-    4. Cached tile fallback
-    
-    Returns: HTML string for the map
-    """
-    import streamlit.components.v1 as components
-    
-    # Use stored center/zoom
-    center = st.session_state.map_center
-    zoom = st.session_state.map_zoom
-    
-    # Convert saved polygons to GeoJSON for display
-    saved_geojson = []
-    if saved_polygons:
-        for i, poly in enumerate(saved_polygons):
-            coords = list(poly.exterior.coords)
-            # Convert to [lng, lat] format for GeoJSON
-            geojson_coords = [[c[0], c[1]] for c in coords]
-            saved_geojson.append({
-                'type': 'Feature',
-                'properties': {'name': f'Region {i+1}', 'index': i},
-                'geometry': {
-                    'type': 'Polygon',
-                    'coordinates': [geojson_coords]
-                }
-            })
-    
-    saved_geojson_str = json.dumps(saved_geojson)
-    
-    # Create the HTML with embedded Leaflet map
-    map_html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-        <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
-        <style>
-            html, body {{
-                margin: 0;
-                padding: 0;
-                height: 100%;
-                width: 100%;
-            }}
-            #map {{
-                width: 100%;
-                height: 500px;
-            }}
-            .area-display {{
-                position: absolute;
-                bottom: 30px;
-                left: 50%;
-                transform: translateX(-50%);
-                background: rgba(0, 0, 0, 0.85);
-                color: #00ff00;
-                padding: 12px 24px;
-                border-radius: 8px;
-                font-size: 16px;
-                font-weight: bold;
-                z-index: 1000;
-                display: none;
-                font-family: 'Courier New', monospace;
-                box-shadow: 0 4px 15px rgba(0,0,0,0.4);
-                border: 2px solid #00ff00;
-            }}
-            .area-display.visible {{
-                display: block;
-            }}
-            .connection-status {{
-                position: absolute;
-                top: 10px;
-                right: 60px;
-                background: rgba(0, 0, 0, 0.7);
-                color: white;
-                padding: 5px 10px;
-                border-radius: 4px;
-                font-size: 12px;
-                z-index: 1000;
-                display: none;
-            }}
-            .connection-status.offline {{
-                display: block;
-                background: rgba(255, 0, 0, 0.8);
-            }}
-            .saved-region-label {{
-                background: rgba(0, 100, 255, 0.8);
-                color: white;
-                padding: 2px 6px;
-                border-radius: 3px;
-                font-size: 11px;
-                font-weight: bold;
-                white-space: nowrap;
-            }}
-            .leaflet-draw-tooltip {{
-                background: rgba(0,0,0,0.8) !important;
-                border: 1px solid #00ff00 !important;
-                color: #00ff00 !important;
-            }}
-        </style>
-    </head>
-    <body>
-        <div id="map"></div>
-        <div id="areaDisplay" class="area-display"></div>
-        <div id="connectionStatus" class="connection-status">⚠️ Offline - View preserved</div>
-        
-        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-        <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
-        <script>
-            // Store view state
-            var savedCenter = [{center[0]}, {center[1]}];
-            var savedZoom = {zoom};
-            var lastValidCenter = savedCenter;
-            var lastValidZoom = savedZoom;
-            var isOnline = navigator.onLine;
-            
-            // Initialize map
-            var map = L.map('map', {{
-                center: savedCenter,
-                zoom: savedZoom,
-                zoomControl: true,
-                preferCanvas: true
-            }});
-            
-            // Tile layers with error handling
-            var googleSatellite = L.tileLayer('https://mt{{s}}.google.com/vt/lyrs=s&x={{x}}&y={{y}}&z={{z}}', {{
-                subdomains: ['0', '1', '2', '3'],
-                attribution: 'Google Satellite',
-                maxZoom: 20,
-                errorTileUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
-            }});
-            
-            var googleMaps = L.tileLayer('https://mt{{s}}.google.com/vt/lyrs=m&x={{x}}&y={{y}}&z={{z}}', {{
-                subdomains: ['0', '1', '2', '3'],
-                attribution: 'Google Maps',
-                maxZoom: 20,
-                errorTileUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
-            }});
-            
-            var osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-                attribution: 'OpenStreetMap',
-                maxZoom: 19,
-                errorTileUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
-            }});
-            
-            // Add default layer
-            googleSatellite.addTo(map);
-            
-            // Layer control
-            var baseMaps = {{
-                "Google Satellite": googleSatellite,
-                "Google Maps": googleMaps,
-                "OpenStreetMap": osm
-            }};
-            L.control.layers(baseMaps, {{}}, {{position: 'topright'}}).addTo(map);
-            
-            // Feature group for drawn items
-            var drawnItems = new L.FeatureGroup();
-            map.addLayer(drawnItems);
-            
-            // Draw control
-            var drawControl = new L.Control.Draw({{
-                position: 'topleft',
-                draw: {{
-                    polyline: false,
-                    circle: false,
-                    circlemarker: false,
-                    marker: false,
-                    polygon: {{
-                        allowIntersection: false,
-                        showArea: true,
-                        shapeOptions: {{
-                            color: '#00ff00',
-                            weight: 3,
-                            fillOpacity: 0.3
-                        }}
-                    }},
-                    rectangle: {{
-                        showArea: true,
-                        shapeOptions: {{
-                            color: '#00ff00',
-                            weight: 3,
-                            fillOpacity: 0.3
-                        }}
-                    }}
-                }},
-                edit: {{
-                    featureGroup: drawnItems,
-                    remove: true
-                }}
-            }});
-            map.addControl(drawControl);
-            
-            // Add saved regions
-            var savedRegions = {saved_geojson_str};
-            savedRegions.forEach(function(feature, index) {{
-                var layer = L.geoJSON(feature, {{
-                    style: {{
-                        color: '#0066ff',
-                        weight: 3,
-                        fillOpacity: 0.2,
-                        fillColor: '#0066ff'
-                    }}
-                }});
-                
-                // Add label
-                var bounds = layer.getBounds();
-                var center = bounds.getCenter();
-                var area = calculateGeoJSONArea(feature.geometry.coordinates[0]);
-                
-                layer.bindTooltip('Region ' + (index + 1) + '<br>' + area.toFixed(2) + ' km²', {{
-                    permanent: true,
-                    direction: 'center',
-                    className: 'saved-region-label'
-                }});
-                
-                layer.addTo(map);
-            }});
-            
-            // Area display element
-            var areaDisplay = document.getElementById('areaDisplay');
-            var connectionStatus = document.getElementById('connectionStatus');
-            
-            // Calculate area from coordinates (in km²)
-            function calculateArea(latlngs) {{
-                if (!latlngs || latlngs.length < 3) return 0;
-                
-                // Shoelace formula with lat/lng to approximate area
-                var n = latlngs.length;
-                var area = 0;
-                
-                for (var i = 0; i < n; i++) {{
-                    var j = (i + 1) % n;
-                    var lat1 = latlngs[i].lat * Math.PI / 180;
-                    var lat2 = latlngs[j].lat * Math.PI / 180;
-                    var lng1 = latlngs[i].lng * Math.PI / 180;
-                    var lng2 = latlngs[j].lng * Math.PI / 180;
-                    
-                    area += (lng2 - lng1) * (2 + Math.sin(lat1) + Math.sin(lat2));
-                }}
-                
-                area = Math.abs(area * 6371 * 6371 / 2);  // Earth radius in km
-                return area;
-            }}
-            
-            // Calculate area from GeoJSON coordinates
-            function calculateGeoJSONArea(coords) {{
-                var latlngs = coords.map(function(c) {{
-                    return {{lat: c[1], lng: c[0]}};
-                }});
-                return calculateArea(latlngs);
-            }}
-            
-            // Track drawing in progress
-            var currentDrawing = null;
-            
-            // Listen to draw events for dynamic area display
-            map.on('draw:drawstart', function(e) {{
-                areaDisplay.classList.add('visible');
-                areaDisplay.textContent = '📐 Area: 0.00 km²';
-            }});
-            
-            map.on('draw:drawvertex', function(e) {{
-                // Get current vertices
-                var layers = e.layers || drawnItems;
-                if (e.layers) {{
-                    e.layers.eachLayer(function(layer) {{
-                        if (layer.getLatLngs) {{
-                            var latlngs = layer.getLatLngs()[0] || layer.getLatLngs();
-                            if (latlngs.length >= 3) {{
-                                var area = calculateArea(latlngs);
-                                areaDisplay.textContent = '📐 Area: ' + area.toFixed(2) + ' km²';
-                            }}
-                        }}
-                    }});
-                }}
-            }});
-            
-            // More reliable: intercept the drawing layer directly
-            map.on(L.Draw.Event.DRAWVERTEX, function(e) {{
-                var drawHandler = e.drawHandler;
-                if (drawHandler && drawHandler._poly) {{
-                    var latlngs = drawHandler._poly.getLatLngs();
-                    if (latlngs && latlngs.length >= 3) {{
-                        var area = calculateArea(latlngs);
-                        areaDisplay.textContent = '📐 Area: ' + area.toFixed(2) + ' km²';
-                    }} else if (latlngs && latlngs.length >= 1) {{
-                        areaDisplay.textContent = '📐 Drawing... (' + latlngs.length + ' points)';
-                    }}
-                }}
-            }});
-            
-            map.on('draw:created', function(e) {{
-                var layer = e.layer;
-                drawnItems.addLayer(layer);
-                
-                // Calculate final area
-                var latlngs = layer.getLatLngs()[0] || layer.getLatLngs();
-                var area = calculateArea(latlngs);
-                areaDisplay.textContent = '✅ Area: ' + area.toFixed(2) + ' km²';
-                
-                // Send data to Streamlit
-                var coords = latlngs.map(function(ll) {{
-                    return [ll.lng, ll.lat];
-                }});
-                // Close the polygon
-                coords.push(coords[0]);
-                
-                // Store in window for Streamlit to access
-                window.lastDrawnPolygon = {{
-                    type: 'Polygon',
-                    coordinates: [coords],
-                    area_km2: area
-                }};
-                
-                // Keep area visible for a moment then fade
-                setTimeout(function() {{
-                    areaDisplay.classList.remove('visible');
-                }}, 3000);
-            }});
-            
-            map.on('draw:deleted', function(e) {{
-                areaDisplay.classList.remove('visible');
-                window.lastDrawnPolygon = null;
-            }});
-            
-            map.on('draw:drawstop', function(e) {{
-                // If cancelled, hide area display
-                setTimeout(function() {{
-                    if (!window.lastDrawnPolygon) {{
-                        areaDisplay.classList.remove('visible');
-                    }}
-                }}, 100);
-            }});
-            
-            // Monitor rectangle drawing specifically (different event flow)
-            map.on('draw:editresize draw:editmove', function(e) {{
-                if (e.layer && e.layer.getLatLngs) {{
-                    var latlngs = e.layer.getLatLngs()[0] || e.layer.getLatLngs();
-                    var area = calculateArea(latlngs);
-                    areaDisplay.textContent = '📐 Area: ' + area.toFixed(2) + ' km²';
-                    areaDisplay.classList.add('visible');
-                }}
-            }});
-            
-            // Save view state on move
-            map.on('moveend', function() {{
-                lastValidCenter = [map.getCenter().lat, map.getCenter().lng];
-                lastValidZoom = map.getZoom();
-                
-                // Store in sessionStorage for persistence
-                try {{
-                    sessionStorage.setItem('mapCenter', JSON.stringify(lastValidCenter));
-                    sessionStorage.setItem('mapZoom', lastValidZoom);
-                }} catch(e) {{}}
-            }});
-            
-            // Handle tile errors gracefully
-            googleSatellite.on('tileerror', function(e) {{
-                console.log('Tile error (handled)');
-            }});
-            googleMaps.on('tileerror', function(e) {{
-                console.log('Tile error (handled)');
-            }});
-            osm.on('tileerror', function(e) {{
-                console.log('Tile error (handled)');
-            }});
-            
-            // Online/offline detection
-            window.addEventListener('online', function() {{
-                isOnline = true;
-                connectionStatus.classList.remove('offline');
-                // Refresh tiles
-                map.eachLayer(function(layer) {{
-                    if (layer.redraw) layer.redraw();
-                }});
-            }});
-            
-            window.addEventListener('offline', function() {{
-                isOnline = false;
-                connectionStatus.classList.add('offline');
-                // View is preserved automatically - no reset needed
-            }});
-            
-            // Restore view from sessionStorage if available
-            try {{
-                var storedCenter = sessionStorage.getItem('mapCenter');
-                var storedZoom = sessionStorage.getItem('mapZoom');
-                if (storedCenter && storedZoom) {{
-                    var center = JSON.parse(storedCenter);
-                    map.setView(center, parseInt(storedZoom), {{animate: false}});
-                }}
-            }} catch(e) {{}}
-            
-            // Periodic check for polygon data (for Streamlit communication)
-            setInterval(function() {{
-                if (window.lastDrawnPolygon) {{
-                    // Update a hidden element that Streamlit can read
-                    var dataEl = document.getElementById('polygonData');
-                    if (dataEl) {{
-                        dataEl.value = JSON.stringify(window.lastDrawnPolygon);
-                    }}
-                }}
-            }}, 500);
-            
-            // Also listen for mouse move during drawing to update area
-            var originalOnMouseMove = L.Draw.Polygon.prototype._onMouseMove;
-            if (originalOnMouseMove) {{
-                L.Draw.Polygon.prototype._onMouseMove = function(e) {{
-                    originalOnMouseMove.call(this, e);
-                    if (this._poly) {{
-                        var latlngs = this._poly.getLatLngs();
-                        // Add current mouse position to simulate closed polygon
-                        var tempLatLngs = latlngs.slice();
-                        tempLatLngs.push(e.latlng);
-                        if (tempLatLngs.length >= 3) {{
-                            var area = calculateArea(tempLatLngs);
-                            areaDisplay.textContent = '📐 Area: ' + area.toFixed(2) + ' km²';
-                            areaDisplay.classList.add('visible');
-                        }}
-                    }}
-                }};
-            }}
-            
-            // Same for rectangle
-            var originalRectOnMouseMove = L.Draw.Rectangle.prototype._onMouseMove;
-            if (originalRectOnMouseMove) {{
-                L.Draw.Rectangle.prototype._onMouseMove = function(e) {{
-                    originalRectOnMouseMove.call(this, e);
-                    if (this._shape) {{
-                        var bounds = this._shape.getBounds();
-                        var latlngs = [
-                            bounds.getSouthWest(),
-                            L.latLng(bounds.getSouth(), bounds.getEast()),
-                            bounds.getNorthEast(),
-                            L.latLng(bounds.getNorth(), bounds.getWest())
-                        ];
-                        var area = calculateArea(latlngs);
-                        areaDisplay.textContent = '📐 Area: ' + area.toFixed(2) + ' km²';
-                        areaDisplay.classList.add('visible');
-                    }}
-                }};
-            }}
-        </script>
-        <input type="hidden" id="polygonData" value="">
-    </body>
-    </html>
-    """
-    
-    return map_html
 
 
 # =============================================================================
@@ -2814,57 +2359,87 @@ def main_classification_tab():
     
     # Show map when not actively processing (map should be visible even after processing completes)
     if not st.session_state.processing_in_progress:
-        import streamlit.components.v1 as components
-        
-        # Create the robust map with saved polygons displayed
-        map_html = create_robust_region_map(saved_polygons=st.session_state.drawn_polygons)
-        
-        # Display info about the map features
         st.info("""
-        **🗺️ Map Controls:**
-        - **Draw**: Use rectangle or polygon tools (top-left) to select a region
-        - **Area Display**: See area in km² in real-time while drawing
-        - **Offline Resilient**: Map view is preserved even if internet drops momentarily
-        - **Saved Regions**: Blue polygons show previously saved regions
+        **🗺️ Map Controls:** Use rectangle or polygon tools (top-left) to draw a region, then click **Save Region**
         """)
         
-        # Render the map
-        map_component = components.html(map_html, height=520, scrolling=False)
+        # Create folium map with saved polygons displayed
+        m = folium.Map(
+            location=st.session_state.map_center, 
+            zoom_start=st.session_state.map_zoom,
+            tiles=None
+        )
         
-        # Alternative: Also provide the standard Folium map for data extraction
-        # (Hidden, but used for capturing drawn polygons via streamlit-folium)
-        with st.expander("📝 **Capture Drawn Region** (click after drawing)", expanded=True):
-            st.write("After drawing on the map above, click 'Capture' to register your region:")
-            
-            # Simple folium map for data capture (smaller, just for interaction)
-            m = folium.Map(location=st.session_state.map_center, zoom_start=st.session_state.map_zoom)
-            plugins.Draw(export=True, position='topleft', draw_options={
-                'polyline': False, 'rectangle': True, 'polygon': True,
-                'circle': False, 'marker': False, 'circlemarker': False
-            }).add_to(m)
-            folium.TileLayer(tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
-                             attr='Google', name='Satellite').add_to(m)
-            
-            # Use a stable key
-            map_key = "capture_map"
-            map_data = st_folium(m, width=700, height=350, key=map_key, returned_objects=["last_active_drawing"])
-            
-            if map_data and map_data.get('last_active_drawing'):
-                geom = map_data['last_active_drawing'].get('geometry', {})
-                if geom.get('type') == 'Polygon':
-                    coords = geom['coordinates'][0]
-                    new_polygon = Polygon(coords)
-                    
-                    # Calculate area
-                    area_km2 = new_polygon.area * 111 * 111  # Approximate conversion
-                    
-                    st.session_state.last_drawn_polygon = new_polygon
-                    
-                    # Update map center based on drawn polygon
-                    centroid = new_polygon.centroid
-                    st.session_state.map_center = [centroid.y, centroid.x]
-                    
-                    st.success(f"✅ Region captured! Area: ~{area_km2:.2f} km²")
+        # Add tile layers
+        folium.TileLayer(
+            tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+            attr='Google Satellite',
+            name='Google Satellite'
+        ).add_to(m)
+        
+        folium.TileLayer(
+            tiles='https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',
+            attr='Google Maps',
+            name='Google Maps'
+        ).add_to(m)
+        
+        folium.TileLayer(
+            tiles='OpenStreetMap',
+            name='OpenStreetMap'
+        ).add_to(m)
+        
+        # Add saved polygons to map
+        for i, poly in enumerate(st.session_state.drawn_polygons):
+            coords = [[c[1], c[0]] for c in poly.exterior.coords]  # Convert to [lat, lng]
+            area_km2 = poly.area * 111 * 111
+            folium.Polygon(
+                locations=coords,
+                color='#0066ff',
+                weight=3,
+                fill=True,
+                fill_color='#0066ff',
+                fill_opacity=0.2,
+                popup=f'Region {i+1}: ~{area_km2:.2f} km²',
+                tooltip=f'Region {i+1}: ~{area_km2:.2f} km²'
+            ).add_to(m)
+        
+        # Add draw control
+        plugins.Draw(
+            export=True, 
+            position='topleft', 
+            draw_options={
+                'polyline': False, 
+                'rectangle': True, 
+                'polygon': True,
+                'circle': False, 
+                'marker': False, 
+                'circlemarker': False
+            }
+        ).add_to(m)
+        
+        # Add layer control
+        folium.LayerControl(position='topright').add_to(m)
+        
+        # Display map
+        map_key = "main_map"
+        map_data = st_folium(m, width=800, height=500, key=map_key, returned_objects=["last_active_drawing", "center", "zoom"])
+        
+        # Update map center/zoom from user interaction
+        if map_data:
+            if map_data.get('center'):
+                st.session_state.map_center = [map_data['center']['lat'], map_data['center']['lng']]
+            if map_data.get('zoom'):
+                st.session_state.map_zoom = map_data['zoom']
+        
+        # Capture drawn polygon
+        if map_data and map_data.get('last_active_drawing'):
+            geom = map_data['last_active_drawing'].get('geometry', {})
+            if geom.get('type') == 'Polygon':
+                coords = geom['coordinates'][0]
+                new_polygon = Polygon(coords)
+                area_km2 = new_polygon.area * 111 * 111
+                st.session_state.last_drawn_polygon = new_polygon
+                st.success(f"✅ Region drawn! Area: ~{area_km2:.2f} km²")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -2884,7 +2459,7 @@ def main_classification_tab():
                     else:
                         st.warning("⚠️ This region is already saved")
                 else:
-                    st.warning("⚠️ Draw and capture a region first")
+                    st.warning("⚠️ Draw a region first")
         
         with col2:
             if st.session_state.last_drawn_polygon:
