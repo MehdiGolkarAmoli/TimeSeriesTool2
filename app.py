@@ -256,7 +256,7 @@ def download_model_from_gdrive(gdrive_url, local_filename):
     """Download model from Google Drive"""
     try:
 
-        # correct_file_id = "1m6EScw-mpBIvWV78h4pyjWq1OLQtn2ov"
+        correct_file_id = "1m6EScw-mpBIvWV78h4pyjWq1OLQtn2ov"
         correct_file_id = "1FhO7OnQinjNTDCTlwc-HLFo6m9OwS47W"
         st.info(f"Downloading model...")
         
@@ -296,7 +296,7 @@ def load_model(model_path):
     try:
         device = torch.device('cpu')
         model = smp.UnetPlusPlus(
-            encoder_name='timm-efficientnet-b8',
+            encoder_name='timm-efficientnet-b7',
             encoder_weights='imagenet',
             in_channels=12,
             classes=1,
