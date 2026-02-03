@@ -1601,7 +1601,7 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                    
                   filtered_thumbnails.append(t)
              
-             thumbnails = filtered_thumbnails
+            thumbnails = filtered_thumbnails
               
     except Exception as e:
         st.error(f"Error: {str(e)}")
