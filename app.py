@@ -255,7 +255,10 @@ def validate_band_file(band_file_path, band_name):
 def download_model_from_gdrive(gdrive_url, local_filename):
     """Download model from Google Drive"""
     try:
-        correct_file_id = "1m6EScw-mpBIvWV78h4pyjWq1OLQtn2ov"
+        # correct_file_id = "1m6EScw-mpBIvWV78h4pyjWq1OLQtn2ov"
+
+        correct_file_id= "1_8jOOSXnELA-xOGW0DKgRMo6RvnJYV5_"
+        # https://drive.google.com/file/d/1_8jOOSXnELA-xOGW0DKgRMo6RvnJYV5_/view?usp=sharing
         st.info(f"Downloading model...")
         
         try:
@@ -294,7 +297,7 @@ def load_model(model_path):
     try:
         device = torch.device('cpu')
         model = smp.UnetPlusPlus(
-            encoder_name='timm-efficientnet-b7',
+            encoder_name='timm-efficientnet-b8',
             encoder_weights='imagenet',
             in_channels=12,
             classes=1,
