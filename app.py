@@ -1597,8 +1597,9 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                      # Remove from probability_maps for change detection
                   if t['month_name'] in st.session_state.probability_maps:
                         del st.session_state.probability_maps[t['month_name']]
-                 else:
-                     filtered_thumbnails.append(t)
+                else:
+                   
+                  filtered_thumbnails.append(t)
              
              thumbnails = filtered_thumbnails
               
