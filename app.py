@@ -1564,46 +1564,40 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         
         st.success(f"✅ Classified {len(thumbnails)} months!")
         
-        # Filter out images with abnormally low building percentage (likely haze/snow)
-        if len(thumbnails) >= 2:
-            building_pcts = [(t['building_pixels'] / t['total_pixels']) * 100 for t in thumbnails]
-            median_pct = np.median(building_pcts)
-            
-            # Filter out images with abnormal building percentage
-# Too low = likely haze/snow, Too high = likely false positives or errors
-if len(thumbnails) >= 2:
-    building_pcts = [(t['building_pixels'] / t['total_pixels']) * 100 for t in thumbnails]
-    median_pct = np.median(building_pcts)
-    
-    LOW_THRESHOLD = 8.0   # Reject if more than 8% below median
-    HIGH_THRESHOLD = 10.0  # Reject if more than 10% above median
-    
-    filtered_thumbnails = []
-    for t in thumbnails:
-        pct = (t['building_pixels'] / t['total_pixels']) * 100
-        
-        if pct < (median_pct - LOW_THRESHOLD):
-            print(f"🚫 Excluded {t['month_name']}: {pct:.1f}% buildings (median={median_pct:.1f}%) - TOO LOW (likely haze/snow)")
-            # Remove from valid_months
-            if t['month_name'] in st.session_state.valid_months:
-                del st.session_state.valid_months[t['month_name']]
-            # Remove from probability_maps for change detection
-            if t['month_name'] in st.session_state.probability_maps:
-                del st.session_state.probability_maps[t['month_name']]
-        elif pct > (median_pct + HIGH_THRESHOLD):
-            print(f"🚫 Excluded {t['month_name']}: {pct:.1f}% buildings (median={median_pct:.1f}%) - TOO HIGH (likely false positives)")
-            # Remove from valid_months
-            if t['month_name'] in st.session_state.valid_months:
-                del st.session_state.valid_months[t['month_name']]
-            # Remove from probability_maps for change detection
-            if t['month_name'] in st.session_state.probability_maps:
-                del st.session_state.probability_maps[t['month_name']]
-        else:
-            filtered_thumbnails.append(t)
-    
-    thumbnails = filtered_thumbnails
-        
-        return thumbnails
+
+         if len(thumbnails) >= 2:
+             building_pcts = [(t['building_pixels'] / t['total_pixels']) * 100 for t in thumbnails]
+             median_pct = np.median(building_pcts)
+             
+             LOW_THRESHOLD = 8.0   # Reject if more than 8% below median
+             HIGH_THRESHOLD = 10.0  # Reject if more than 10% above median
+             
+             filtered_thumbnails = []
+             for t in thumbnails:
+                 pct = (t['building_pixels'] / t['total_pixels']) * 100
+                 
+                 if pct < (median_pct - LOW_THRESHOLD):
+                     print(f"🚫 Excluded {t['month_name']}: {pct:.1f}% buildings (median={median_pct:.1f}%) - TOO LOW (likely haze/snow)")
+                     # Remove from valid_months
+                     if t['month_name'] in st.session_state.valid_months:
+                         del st.session_state.valid_months[t['month_name']]
+                     # Remove from probability_maps for change detection
+                     if t['month_name'] in st.session_state.probability_maps:
+                         del st.session_state.probability_maps[t['month_name']]
+                 elif pct > (median_pct + HIGH_THRESHOLD):
+                     print(f"🚫 Excluded {t['month_name']}: {pct:.1f}% buildings (median={median_pct:.1f}%) - TOO HIGH (likely false positives)")
+                     # Remove from valid_months
+                     if t['month_name'] in st.session_state.valid_months:
+                         del st.session_state.valid_months[t['month_name']]
+                     # Remove from probability_maps for change detection
+                     if t['month_name'] in st.session_state.probability_maps:
+                         del st.session_state.probability_maps[t['month_name']]
+                 else:
+                     filtered_thumbnails.append(t)
+             
+             thumbnails = filtered_thumbnails
+                 
+                 return thumbnails
         
     except Exception as e:
         st.error(f"Error: {str(e)}")
