@@ -2308,8 +2308,27 @@ def main_classification_tab():
         if map_data and map_data.get('last_active_drawing'):
             geom = map_data['last_active_drawing'].get('geometry', {})
             if geom.get('type') == 'Polygon':
-                st.session_state.last_drawn_polygon = Polygon(geom['coordinates'][0])
-                st.success(f"✅ Region selected")
+                drawn_poly = Polygon(geom['coordinates'][0])
+                st.session_state.last_drawn_polygon = drawn_poly
+                
+                # Calculate area dynamically using geodesic approximation
+                coords = geom['coordinates'][0]
+                centroid = drawn_poly.centroid
+                lat_center = centroid.y
+                km_per_deg_lat = 111.32
+                km_per_deg_lon = 111.32 * math.cos(math.radians(lat_center))
+                
+                n = len(coords) - 1
+                area_km2 = 0.0
+                for i in range(n):
+                    x1 = coords[i][0] * km_per_deg_lon
+                    y1 = coords[i][1] * km_per_deg_lat
+                    x2 = coords[(i + 1) % n][0] * km_per_deg_lon
+                    y2 = coords[(i + 1) % n][1] * km_per_deg_lat
+                    area_km2 += x1 * y2 - x2 * y1
+                area_km2 = abs(area_km2) / 2.0
+                
+                st.success(f"✅ Region selected — **{area_km2:.2f} km²**")
         
         if st.button("💾 Save Region"):
             if st.session_state.last_drawn_polygon:
