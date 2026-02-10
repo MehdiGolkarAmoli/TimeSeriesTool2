@@ -182,12 +182,28 @@ if 'log_pdf_bytes' not in st.session_state:
 # Normalization function
 # =============================================================================
 def normalized(img):
-    """Normalize image data to range [0, 1] - global normalization"""
-    min_val = np.nanmin(img)
-    max_val = np.nanmax(img)
+
+    img_clean = img.copy().astype(np.float32)
+
+    if img_clean.ndim == 3:
+        all_zero_mask = np.all(img_clean == 0, axis=-1)
+        if np.any(all_zero_mask):
+            img_clean[all_zero_mask] = np.nan
+    elif img_clean.ndim == 2:
+        zero_mask = (img_clean == 0)
+        if np.any(zero_mask):
+            img_clean[zero_mask] = np.nan
+
+    min_val = np.nanmin(img_clean)
+    max_val = np.nanmax(img_clean)
+
     if max_val == min_val:
-        return np.zeros_like(img)
-    return (img - min_val) / (max_val - min_val)
+        return np.zeros_like(img, dtype=np.float32)
+
+    result = (img_clean - min_val) / (max_val - min_val)
+    result = np.nan_to_num(result, nan=0.0)
+
+    return result
 
 
 # =============================================================================
@@ -402,23 +418,21 @@ def create_cloud_free_collection(aoi, extended_start, extended_end, cloudy_pixel
     
     # Apply cloud masking (maskCloudAndShadow) - matching JS exactly
     def mask_cloud_and_shadow(img):
-        # Get cloud probability band
         cloud_prob = img.select('probability')
-        
-        # Calculate CDI (Cloud Displacement Index)
         cdi = ee.Algorithms.Sentinel2.CDI(img)
-        
-        # Cloud mask: prob > 65 AND cdi < -0.5
         is_cloud = cloud_prob.gt(CLOUD_PROB_THRESHOLD).And(cdi.lt(CDI_THRESHOLD))
-        
-        # Dilate with 20m kernel, 2 iterations
         kernel = ee.Kernel.circle(radius=20, units='meters')
         cloud_dilated = is_cloud.focal_max(kernel=kernel, iterations=2)
-        
-        # Mask clouds and scale
         masked = img.updateMask(cloud_dilated.Not())
         scaled = masked.select(SPECTRAL_BANDS).multiply(0.0001).clip(aoi)
-        
+
+        # FIX 2: Mask pixels where ALL bands are zero after scaling.
+        # No land surface has 0 reflectance in all 12 bands — these are
+        # sensor artifacts or deep shadows that escaped cloud masking.
+        band_sum = scaled.reduce(ee.Reducer.sum())
+        all_zero = band_sum.eq(0)
+        scaled = scaled.updateMask(all_zero.Not())
+
         return scaled.copyProperties(img, ['system:time_start'])
     
     return s2_joined.map(mask_cloud_and_shadow)
@@ -727,28 +741,48 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
             return None, STATUS_REJECTED, f"No gap-fill candidates, {masked_percent:.1f}% still masked"
         
         # Create mosaic (closest pixel first)
+        # closest_mosaic = sorted_images.mosaic().select(SPECTRAL_BANDS)
+        # has_closest = closest_mosaic.select('B4').mask()
+        
+        # fill_from_closest = gap_mask.And(has_closest)
+        # still_masked = gap_mask.And(has_closest.Not())
+        
+        # filled_composite = composite.unmask(closest_mosaic.updateMask(fill_from_closest))
+        
+        # # Check remaining masked pixels
+        # fill_source = (ee.Image.constant(0).clip(aoi).toInt8()
+        #                .where(fill_from_closest, 1)
+        #                .where(still_masked, 2)
+        #                .rename('fill_source'))
+        
+        # still_masked_result = fill_source.eq(2).reduceRegion(
+        #     reducer=ee.Reducer.sum(), geometry=aoi, scale=10, maxPixels=1e13
+        # ).get('fill_source')
+        
+        # still_masked_count = ee.Number(ee.Algorithms.If(
+        #     ee.Algorithms.IsEqual(still_masked_result, None), 0, still_masked_result
+        # )).getInfo()
         closest_mosaic = sorted_images.mosaic().select(SPECTRAL_BANDS)
         has_closest = closest_mosaic.select('B4').mask()
-        
-        fill_from_closest = gap_mask.And(has_closest)
-        still_masked = gap_mask.And(has_closest.Not())
-        
-        filled_composite = composite.unmask(closest_mosaic.updateMask(fill_from_closest))
-        
-        # Check remaining masked pixels
-        fill_source = (ee.Image.constant(0).clip(aoi).toInt8()
-                       .where(fill_from_closest, 1)
-                       .where(still_masked, 2)
-                       .rename('fill_source'))
-        
-        still_masked_result = fill_source.eq(2).reduceRegion(
+
+        # FIX 3: Use .where() instead of .unmask() for gap-filling
+        # .unmask() converts ALL remaining masked pixels to 0 silently.
+        # .where(condition, value) only fills where condition is True,
+        # leaving unfillable pixels as masked (NoData).
+        can_fill = gap_mask.And(has_closest)
+        filled_composite = composite.where(can_fill, closest_mosaic)
+
+        # Check remaining masked pixels in the ACTUAL filled composite
+        filled_valid_mask = filled_composite.select('B4').mask()  # 1=valid, 0=masked
+        still_masked_count_img = filled_valid_mask.Not().reduceRegion(
             reducer=ee.Reducer.sum(), geometry=aoi, scale=10, maxPixels=1e13
-        ).get('fill_source')
-        
+        )
         still_masked_count = ee.Number(ee.Algorithms.If(
-            ee.Algorithms.IsEqual(still_masked_result, None), 0, still_masked_result
+            ee.Algorithms.IsEqual(still_masked_count_img.get('B4'), None),
+            0,
+            still_masked_count_img.get('B4')
         )).getInfo()
-        
+
         # CHECK 4: After gap-fill
         if still_masked_count == 0:
             add_log_entry(f"{month_name}: Gap-fill SUCCESSFUL, starting download", "INFO")
