@@ -200,7 +200,7 @@ def normalized(img):
     if max_val == min_val:
         return np.zeros_like(img, dtype=np.float32)
 
-    result = (img_clean - min_val) / (max_val - min_val)
+    result = (img_clean - min_val) / (max_val - min_val+1e-6)
     result = np.nan_to_num(result, nan=0.0)
 
     return result
