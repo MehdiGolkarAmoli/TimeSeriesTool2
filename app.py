@@ -187,7 +187,7 @@ def normalized(img):
     max_val = np.nanmax(img)
     if max_val == min_val:
         return np.zeros_like(img)
-    return (img - min_val) / (max_val - min_val + 1e-5)
+    return (img - min_val) / (max_val - min_val )
 
 
 # =============================================================================
