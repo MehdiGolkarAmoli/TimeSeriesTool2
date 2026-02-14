@@ -655,7 +655,7 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
         def create_valid_mask(img):
     # Pixel is valid only if ALL key bands have data
             valid = (img.select('B4').mask()
-                    .And(img.select('B11').mask())
+                    .And(img.select('B11').mask()))
             return ee.Image(1).updateMask(valid).unmask(0).toInt()
         
         frequency = monthly_images.map(create_valid_mask).sum().toInt().rename('frequency')
