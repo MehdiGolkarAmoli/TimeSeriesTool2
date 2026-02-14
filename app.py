@@ -187,7 +187,7 @@ def normalized(img):
     max_val = np.nanmax(img)
     if max_val == min_val:
         return np.zeros_like(img)
-    return (img - min_val) / (max_val - min_val )
+    return (img - min_val) / (max_val - min_val + 1e-5)
 
 
 # =============================================================================
@@ -648,9 +648,16 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
         except Exception as e:
             add_log_entry(f"{month_name}: Failed to capture component images: {e}", "WARNING")
         
-        # Create frequency map and median composite
+
+        # # Create frequency map and median composite
+        # def create_valid_mask(img):
+        #     return ee.Image(1).updateMask(img.select('B4').mask()).unmask(0).toInt()
         def create_valid_mask(img):
-            return ee.Image(1).updateMask(img.select('B4').mask()).unmask(0).toInt()
+    # Pixel is valid only if ALL key bands have data
+            valid = (img.select('B4').mask()
+                    .And(img.select('B11').mask())
+                    .And(img.select('B8').mask()))
+            return ee.Image(1).updateMask(valid).unmask(0).toInt()
         
         frequency = monthly_images.map(create_valid_mask).sum().toInt().rename('frequency')
         composite = monthly_images.median()
