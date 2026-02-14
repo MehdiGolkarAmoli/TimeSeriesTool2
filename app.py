@@ -678,12 +678,12 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
             return None, STATUS_NO_DATA, "No valid pixels"
         
         masked_percent = (masked_count / total_count) * 100
-        add_log_entry(f"{month_name}: Masked pixels: {masked_percent:.2f}% ({masked_count}/{total_count})", "INFO")
+        add_log_entry(f"{month_name}: Masked pixels: {masked_percent:.5f}% ({masked_count}/{total_count})", "INFO")
         
         # CHECK 2: Too many masked (> 30%)
         if masked_percent > MAX_MASKED_PERCENT_FOR_GAPFILL:
-            add_log_entry(f"{month_name}: SKIPPED - Masked {masked_percent:.1f}% > {MAX_MASKED_PERCENT_FOR_GAPFILL}%", "WARNING")
-            return None, STATUS_SKIPPED, f"Masked {masked_percent:.1f}% > {MAX_MASKED_PERCENT_FOR_GAPFILL}%"
+            add_log_entry(f"{month_name}: SKIPPED - Masked {masked_percent:.5f}% > {MAX_MASKED_PERCENT_FOR_GAPFILL}%", "WARNING")
+            return None, STATUS_SKIPPED, f"Masked {masked_percent:.5f}% > {MAX_MASKED_PERCENT_FOR_GAPFILL}%"
         
         # CHECK 3: No masked pixels - ready to download
         if masked_percent == 0:
@@ -700,9 +700,9 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
                 return None, STATUS_REJECTED, "Download failed"
         
         # GAP-FILL: 0% < masked <= 30%
-        add_log_entry(f"{month_name}: Starting gap-fill ({masked_percent:.1f}% masked)", "INFO")
+        add_log_entry(f"{month_name}: Starting gap-fill ({masked_percent:.5f}% masked)", "INFO")
         if status_placeholder:
-            status_placeholder.text(f"📥 {month_name}: Gap-filling ({masked_percent:.1f}% masked)...")
+            status_placeholder.text(f"📥 {month_name}: Gap-filling ({masked_percent:.5f}% masked)...")
         
         gap_mask = frequency.eq(0)
         month_middle_millis = month_middle.millis()
@@ -731,7 +731,7 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
         
         if candidate_count == 0:
             add_log_entry(f"{month_name}: REJECTED - No gap-fill candidates", "WARNING")
-            return None, STATUS_REJECTED, f"No gap-fill candidates, {masked_percent:.1f}% still masked"
+            return None, STATUS_REJECTED, f"No gap-fill candidates, {masked_percent:.5f}% still masked"
         
         # Create mosaic (closest pixel first)
         closest_mosaic = sorted_images.mosaic().select(SPECTRAL_BANDS)
@@ -765,14 +765,14 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
             path = download_composite(filled_composite, aoi, output_file, month_name, scale, status_placeholder)
             if path:
                 add_log_entry(f"{month_name}: Download SUCCESSFUL after gap-fill", "INFO")
-                return path, STATUS_COMPLETE, f"Complete after gap-fill (was {masked_percent:.1f}%)"
+                return path, STATUS_COMPLETE, f"Complete after gap-fill (was {masked_percent:.5f}%)"
             else:
                 add_log_entry(f"{month_name}: Download FAILED after gap-fill", "ERROR")
                 return None, STATUS_REJECTED, "Download failed after gap-fill"
         else:
             still_masked_pct = (still_masked_count / total_count) * 100
-            add_log_entry(f"{month_name}: REJECTED - {still_masked_pct:.1f}% still masked after gap-fill", "WARNING")
-            return None, STATUS_REJECTED, f"{still_masked_pct:.1f}% still masked after gap-fill"
+            add_log_entry(f"{month_name}: REJECTED - {still_masked_pct:.5f}% still masked after gap-fill", "WARNING")
+            return None, STATUS_REJECTED, f"{still_masked_pct:.5f}% still masked after gap-fill"
         
     except Exception as e:
         add_log_entry(f"{month_name}: ERROR - {str(e)}", "ERROR")
