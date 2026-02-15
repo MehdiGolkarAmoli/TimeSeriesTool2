@@ -1449,13 +1449,36 @@ def get_image_download_data(image_path, month_name):
         return None
 
 
-def create_sentinel2_images_zip(downloaded_images):
+# def create_sentinel2_images_zip(downloaded_images):
+#     """
+#     Create a ZIP file containing ALL downloaded Sentinel-2 composite images.
+#     Includes both valid-patch and non-valid-patch months.
+    
+#     Args:
+#         downloaded_images: Dict of {month_name: image_path} - ALL downloaded images
+    
+#     Returns:
+#         BytesIO buffer containing the ZIP file
+#     """
+#     import zipfile
+    
+#     zip_buffer = BytesIO()
+    
+#     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+#         for month_name, image_path in sorted(downloaded_images.items()):
+#             if os.path.exists(image_path):
+#                 # Add file to zip with a clear filename
+#                 zip_file.write(image_path, f"sentinel2_{month_name}_12bands.tif")
+    
+#     zip_buffer.seek(0)
+    # return zip_buffer
+def create_sentinel2_images_zip(downloaded_images, selected_months=None):
     """
-    Create a ZIP file containing ALL downloaded Sentinel-2 composite images.
-    Includes both valid-patch and non-valid-patch months.
+    Create a ZIP file containing selected Sentinel-2 composite images.
     
     Args:
         downloaded_images: Dict of {month_name: image_path} - ALL downloaded images
+        selected_months: List of month names to include (None = all months)
     
     Returns:
         BytesIO buffer containing the ZIP file
@@ -1464,14 +1487,365 @@ def create_sentinel2_images_zip(downloaded_images):
     
     zip_buffer = BytesIO()
     
+    # Filter months if selection provided
+    months_to_zip = downloaded_images
+    if selected_months is not None:
+        months_to_zip = {k: v for k, v in downloaded_images.items() if k in selected_months}
+    
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for month_name, image_path in sorted(downloaded_images.items()):
+        for month_name, image_path in sorted(months_to_zip.items()):
             if os.path.exists(image_path):
                 # Add file to zip with a clear filename
                 zip_file.write(image_path, f"sentinel2_{month_name}_12bands.tif")
     
     zip_buffer.seek(0)
     return zip_buffer
+
+
+def display_thumbnails(thumbnails, valid_months=None, downloaded_images=None):
+    if not thumbnails:
+        return
+    
+    # Add "Download All Sentinel-2 Images" section at the top
+    if downloaded_images and len(downloaded_images) > 0:
+        st.subheader("📦 Bulk Download Sentinel-2 Images")
+        
+        # Categorize months
+        included_months = set(valid_months.keys()) if valid_months else set()
+        excluded_months = set(downloaded_images.keys()) - included_months
+        
+        num_included = len(included_months)
+        num_excluded = len(excluded_months)
+        num_total = len(downloaded_images)
+        
+        # Show statistics
+        col1, col2, col3 = st.columns(3)
+        col1.metric("✅ Included (Valid Patches)", num_included)
+        col2.metric("❌ Excluded (Missing Patches)", num_excluded)
+        col3.metric("📊 Total Downloaded", num_total)
+        
+        st.divider()
+        
+        # Month selection interface
+        st.write("**Select months to download:**")
+        
+        # Selection mode
+        selection_mode = st.radio(
+            "Selection Mode:",
+            ["All Months", "Included Only", "Excluded Only", "Custom Selection"],
+            horizontal=True,
+            help="Choose which months to include in the ZIP file"
+        )
+        
+        selected_months = None
+        
+        if selection_mode == "All Months":
+            selected_months = list(downloaded_images.keys())
+            st.info(f"📦 Will download **all {num_total} months** (included + excluded)")
+            
+        elif selection_mode == "Included Only":
+            selected_months = sorted(included_months)
+            st.success(f"✅ Will download **{num_included} included months** (with valid patches)")
+            with st.expander("📋 View included months"):
+                st.write(", ".join(selected_months))
+            
+        elif selection_mode == "Excluded Only":
+            selected_months = sorted(excluded_months)
+            st.warning(f"❌ Will download **{num_excluded} excluded months** (with missing patches)")
+            with st.expander("📋 View excluded months"):
+                st.write(", ".join(selected_months))
+            
+        elif selection_mode == "Custom Selection":
+            st.write("**Included Months (Valid Patches):**")
+            selected_included = []
+            if included_months:
+                cols_included = st.columns(min(4, len(included_months)))
+                for idx, month in enumerate(sorted(included_months)):
+                    with cols_included[idx % len(cols_included)]:
+                        if st.checkbox(month, value=True, key=f"inc_{month}"):
+                            selected_included.append(month)
+            
+            st.write("**Excluded Months (Missing Patches):**")
+            selected_excluded = []
+            if excluded_months:
+                cols_excluded = st.columns(min(4, len(excluded_months)))
+                for idx, month in enumerate(sorted(excluded_months)):
+                    with cols_excluded[idx % len(cols_excluded)]:
+                        if st.checkbox(month, value=False, key=f"exc_{month}"):
+                            selected_excluded.append(month)
+            
+            selected_months = selected_included + selected_excluded
+            st.info(f"📦 Selected **{len(selected_months)}** months: {len(selected_included)} included + {len(selected_excluded)} excluded")
+        
+        # Download button
+        st.divider()
+        
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            prepare_clicked = st.button(
+                f"📦 Prepare ZIP ({len(selected_months)} months)", 
+                type="primary",
+                disabled=not selected_months
+            )
+            
+            if prepare_clicked:
+                with st.spinner(f"Creating ZIP file with {len(selected_months)} Sentinel-2 images..."):
+                    zip_buffer = create_sentinel2_images_zip(downloaded_images, selected_months)
+                    st.session_state.sentinel2_zip = zip_buffer.getvalue()
+                    st.session_state.sentinel2_zip_info = {
+                        'num_months': len(selected_months),
+                        'month_list': selected_months,
+                        'selection_mode': selection_mode
+                    }
+                    st.success("✅ ZIP file ready!")
+        
+        with col2:
+            if 'sentinel2_zip' in st.session_state and st.session_state.sentinel2_zip:
+                zip_info = st.session_state.get('sentinel2_zip_info', {})
+                num_in_zip = zip_info.get('num_months', num_total)
+                mode_label = zip_info.get('selection_mode', 'Custom')
+                
+                st.download_button(
+                    label=f"⬇️ Download Sentinel-2 Images ({num_in_zip} months)",
+                    data=st.session_state.sentinel2_zip,
+                    file_name=f"sentinel2_{mode_label.lower().replace(' ', '_')}_{num_in_zip}months.zip",
+                    mime="application/zip",
+                    help=f"ZIP contains {num_in_zip} Sentinel-2 12-band composite images"
+                )
+                
+                # Show what's in the ZIP
+                if zip_info.get('month_list'):
+                    with st.expander(f"📋 Contents ({num_in_zip} months)"):
+                        months_display = ", ".join(sorted(zip_info['month_list']))
+                        st.text(months_display)
+        
+        st.divider()
+    
+    # Rest of the thumbnail display code remains the same
+    mode = st.radio("Display:", ["Side by Side", "Classification", "RGB"], horizontal=True)
+    st.divider()
+    
+    if mode == "Side by Side":
+        for i in range(0, len(thumbnails), 2):
+            cols = st.columns(4)
+            for j in range(2):
+                idx = i + j
+                if idx < len(thumbnails):
+                    t = thumbnails[idx]
+                    pct = (t['building_pixels'] / t['total_pixels']) * 100
+                    suffix = " (filled)" if t.get('gap_filled') else ""
+                    cols[j*2].image(t['rgb_image'], caption=f"{t['month_name']} RGB{suffix}")
+                    # Add download button under RGB
+                    if valid_months and t['month_name'] in valid_months:
+                        image_path = valid_months[t['month_name']]
+                        image_data = get_image_download_data(image_path, t['month_name'])
+                        if image_data:
+                            cols[j*2].download_button(
+                                label=f"⬇️ Download {t['month_name']}",
+                                data=image_data,
+                                file_name=f"sentinel2_{t['month_name']}_12bands.tif",
+                                mime="image/tiff",
+                                key=f"dl_sidebyside_{t['month_name']}"
+                            )
+                    cols[j*2+1].image(t['classification_image'], caption=f"{t['month_name']} ({pct:.1f}%)")
+    else:
+        key = 'classification_image' if mode == "Classification" else 'rgb_image'
+        for row in range((len(thumbnails) + 3) // 4):
+            cols = st.columns(4)
+            for c in range(4):
+                idx = row * 4 + c
+                if idx < len(thumbnails):
+                    t = thumbnails[idx]
+                    pct = (t['building_pixels'] / t['total_pixels']) * 100
+                    cap = f"{t['month_name']} ({pct:.1f}%)" if mode == "Classification" else t['month_name']
+                    if t.get(key):
+                        cols[c].image(t[key], caption=cap)
+                        # Add download button under RGB images only
+                        if mode == "RGB" and valid_months and t['month_name'] in valid_months:
+                            image_path = valid_months[t['month_name']]
+                            image_data = get_image_download_data(image_path, t['month_name'])
+                            if image_data:
+                                cols[c].download_button(
+                                    label=f"⬇️ Download",
+                                    data=image_data,
+                                    file_name=f"sentinel2_{t['month_name']}_12bands.tif",
+                                    mime="image/tiff",
+                                    key=f"dl_rgb_{t['month_name']}"
+                                )
+
+
+def display_thumbnails(thumbnails, valid_months=None, downloaded_images=None):
+    if not thumbnails:
+        return
+    
+    # Add "Download All Sentinel-2 Images" section at the top
+    if downloaded_images and len(downloaded_images) > 0:
+        st.subheader("📦 Bulk Download Sentinel-2 Images")
+        
+        # Categorize months
+        included_months = set(valid_months.keys()) if valid_months else set()
+        excluded_months = set(downloaded_images.keys()) - included_months
+        
+        num_included = len(included_months)
+        num_excluded = len(excluded_months)
+        num_total = len(downloaded_images)
+        
+        # Show statistics
+        col1, col2, col3 = st.columns(3)
+        col1.metric("✅ Included (Valid Patches)", num_included)
+        col2.metric("❌ Excluded (Missing Patches)", num_excluded)
+        col3.metric("📊 Total Downloaded", num_total)
+        
+        st.divider()
+        
+        # Month selection interface
+        st.write("**Select months to download:**")
+        
+        # Selection mode
+        selection_mode = st.radio(
+            "Selection Mode:",
+            ["All Months", "Included Only", "Excluded Only", "Custom Selection"],
+            horizontal=True,
+            help="Choose which months to include in the ZIP file"
+        )
+        
+        selected_months = None
+        
+        if selection_mode == "All Months":
+            selected_months = list(downloaded_images.keys())
+            st.info(f"📦 Will download **all {num_total} months** (included + excluded)")
+            
+        elif selection_mode == "Included Only":
+            selected_months = sorted(included_months)
+            st.success(f"✅ Will download **{num_included} included months** (with valid patches)")
+            with st.expander("📋 View included months"):
+                st.write(", ".join(selected_months))
+            
+        elif selection_mode == "Excluded Only":
+            selected_months = sorted(excluded_months)
+            st.warning(f"❌ Will download **{num_excluded} excluded months** (with missing patches)")
+            with st.expander("📋 View excluded months"):
+                st.write(", ".join(selected_months))
+            
+        elif selection_mode == "Custom Selection":
+            st.write("**Included Months (Valid Patches):**")
+            selected_included = []
+            if included_months:
+                cols_included = st.columns(min(4, len(included_months)))
+                for idx, month in enumerate(sorted(included_months)):
+                    with cols_included[idx % len(cols_included)]:
+                        if st.checkbox(month, value=True, key=f"inc_{month}"):
+                            selected_included.append(month)
+            
+            st.write("**Excluded Months (Missing Patches):**")
+            selected_excluded = []
+            if excluded_months:
+                cols_excluded = st.columns(min(4, len(excluded_months)))
+                for idx, month in enumerate(sorted(excluded_months)):
+                    with cols_excluded[idx % len(cols_excluded)]:
+                        if st.checkbox(month, value=False, key=f"exc_{month}"):
+                            selected_excluded.append(month)
+            
+            selected_months = selected_included + selected_excluded
+            st.info(f"📦 Selected **{len(selected_months)}** months: {len(selected_included)} included + {len(selected_excluded)} excluded")
+        
+        # Download button
+        st.divider()
+        
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            prepare_clicked = st.button(
+                f"📦 Prepare ZIP ({len(selected_months)} months)", 
+                type="primary",
+                disabled=not selected_months
+            )
+            
+            if prepare_clicked:
+                with st.spinner(f"Creating ZIP file with {len(selected_months)} Sentinel-2 images..."):
+                    zip_buffer = create_sentinel2_images_zip(downloaded_images, selected_months)
+                    st.session_state.sentinel2_zip = zip_buffer.getvalue()
+                    st.session_state.sentinel2_zip_info = {
+                        'num_months': len(selected_months),
+                        'month_list': selected_months,
+                        'selection_mode': selection_mode
+                    }
+                    st.success("✅ ZIP file ready!")
+        
+        with col2:
+            if 'sentinel2_zip' in st.session_state and st.session_state.sentinel2_zip:
+                zip_info = st.session_state.get('sentinel2_zip_info', {})
+                num_in_zip = zip_info.get('num_months', num_total)
+                mode_label = zip_info.get('selection_mode', 'Custom')
+                
+                st.download_button(
+                    label=f"⬇️ Download Sentinel-2 Images ({num_in_zip} months)",
+                    data=st.session_state.sentinel2_zip,
+                    file_name=f"sentinel2_{mode_label.lower().replace(' ', '_')}_{num_in_zip}months.zip",
+                    mime="application/zip",
+                    help=f"ZIP contains {num_in_zip} Sentinel-2 12-band composite images"
+                )
+                
+                # Show what's in the ZIP
+                if zip_info.get('month_list'):
+                    with st.expander(f"📋 Contents ({num_in_zip} months)"):
+                        months_display = ", ".join(sorted(zip_info['month_list']))
+                        st.text(months_display)
+        
+        st.divider()
+    
+    # Rest of the thumbnail display code remains the same
+    mode = st.radio("Display:", ["Side by Side", "Classification", "RGB"], horizontal=True)
+    st.divider()
+    
+    if mode == "Side by Side":
+        for i in range(0, len(thumbnails), 2):
+            cols = st.columns(4)
+            for j in range(2):
+                idx = i + j
+                if idx < len(thumbnails):
+                    t = thumbnails[idx]
+                    pct = (t['building_pixels'] / t['total_pixels']) * 100
+                    suffix = " (filled)" if t.get('gap_filled') else ""
+                    cols[j*2].image(t['rgb_image'], caption=f"{t['month_name']} RGB{suffix}")
+                    # Add download button under RGB
+                    if valid_months and t['month_name'] in valid_months:
+                        image_path = valid_months[t['month_name']]
+                        image_data = get_image_download_data(image_path, t['month_name'])
+                        if image_data:
+                            cols[j*2].download_button(
+                                label=f"⬇️ Download {t['month_name']}",
+                                data=image_data,
+                                file_name=f"sentinel2_{t['month_name']}_12bands.tif",
+                                mime="image/tiff",
+                                key=f"dl_sidebyside_{t['month_name']}"
+                            )
+                    cols[j*2+1].image(t['classification_image'], caption=f"{t['month_name']} ({pct:.1f}%)")
+    else:
+        key = 'classification_image' if mode == "Classification" else 'rgb_image'
+        for row in range((len(thumbnails) + 3) // 4):
+            cols = st.columns(4)
+            for c in range(4):
+                idx = row * 4 + c
+                if idx < len(thumbnails):
+                    t = thumbnails[idx]
+                    pct = (t['building_pixels'] / t['total_pixels']) * 100
+                    cap = f"{t['month_name']} ({pct:.1f}%)" if mode == "Classification" else t['month_name']
+                    if t.get(key):
+                        cols[c].image(t[key], caption=cap)
+                        # Add download button under RGB images only
+                        if mode == "RGB" and valid_months and t['month_name'] in valid_months:
+                            image_path = valid_months[t['month_name']]
+                            image_data = get_image_download_data(image_path, t['month_name'])
+                            if image_data:
+                                cols[c].download_button(
+                                    label=f"⬇️ Download",
+                                    data=image_data,
+                                    file_name=f"sentinel2_{t['month_name']}_12bands.tif",
+                                    mime="image/tiff",
+                                    key=f"dl_rgb_{t['month_name']}"
+                                )
 
 
 def display_thumbnails(thumbnails, valid_months=None, downloaded_images=None):
