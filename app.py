@@ -1,6 +1,6 @@
 """
 Sentinel-2 Time Series Building Classification
-VERSION 06 - GEE Cloud Masking + Gap-Filling + Python Patch Validation
+VERSION 06 - GEE Cloud Masking + Gap-Filling + Python Patch Validation + Zero-Value Preprocessing
 
 ALGORITHM (matching JS code):
 ═══════════════════════════════════════════════════════════════════════════════
@@ -23,15 +23,17 @@ GEE SERVER-SIDE:
           * If masked_after > 0%  → "rejected" → SKIP
 
 PYTHON CLIENT-SIDE (after download):
-5. Validate all downloaded images have SAME dimensions
-6. Check patch validity (NaN/zeros) for each month
-7. Find the month with MAXIMUM valid patches (reference)
-8. EXCLUDE months that don't have ALL reference patches valid
-9. Classify only valid months using reference patch mask
+5. **NEW**: Preprocess to fix zero-value pixels (add 1e-3 to bands with 0)
+6. Validate all downloaded images have SAME dimensions
+7. Check patch validity (NaN/zeros) for each month
+8. Find the month with MAXIMUM valid patches (reference)
+9. EXCLUDE months that don't have ALL reference patches valid
+10. Classify only valid months using reference patch mask
 
 GUARANTEES:
 ═══════════════════════════════════════════════════════════════════════════════
 ✅ All downloaded images have 0% masked pixels (GEE-side guarantee)
+✅ All downloaded images have NO zero-value pixels in any band (preprocessing)
 ✅ All downloaded images have identical dimensions (validated in Python)
 ✅ All classified months have SAME valid patches (reference mask)
 ✅ Months with missing patches are EXCLUDED (not reduced to minimum)
@@ -174,7 +176,7 @@ def normalized(img):
     max_val = np.nanmax(img)
     if max_val == min_val:
         return np.zeros_like(img)
-    return (img - min_val) / (max_val - min_val)
+    return (img - min_val) / (max_val - min_val + 1e-3)
 
 
 # =============================================================================
@@ -531,6 +533,67 @@ def download_composite(composite, aoi, output_path, month_name, scale=10, status
         return None
 
 
+# =============================================================================
+# NEW: Zero-Value Preprocessing Function
+# =============================================================================
+def preprocess_zero_values(image_path, month_name):
+    """
+    Check each pixel and add 1e-3 to any band that has a value of 0.
+    Modifies the image file in-place.
+    
+    This ensures no pixel has zero value in any band before patching,
+    which can cause issues during classification.
+    
+    Args:
+        image_path: Path to the GeoTIFF file
+        month_name: Name of the month (for logging)
+    
+    Returns:
+        True if preprocessing was successful, False otherwise
+    """
+    try:
+        # Read the image
+        with rasterio.open(image_path) as src:
+            img_data = src.read()  # Shape: (bands, height, width)
+            profile = src.profile
+        
+        # Create mask where values are exactly 0
+        zero_mask = (img_data == 0)
+        
+        if np.any(zero_mask):
+            # Count zeros per band for logging
+            zeros_per_band = np.sum(zero_mask, axis=(1, 2))
+            total_zeros = np.sum(zeros_per_band)
+            
+            # Log which bands have zeros (show first 3 bands)
+            bands_with_zeros = []
+            for i in range(len(zeros_per_band)):
+                if zeros_per_band[i] > 0:
+                    bands_with_zeros.append(f"Band{i+1}:{int(zeros_per_band[i])}")
+            
+            # Add 1e-3 to zero values (only affects pixels with 0 in specific bands)
+            img_data[zero_mask] = 1e-3
+            
+            # Write corrected data back to file
+            with rasterio.open(image_path, 'w', **profile) as dst:
+                dst.write(img_data)
+            
+            # Show abbreviated band list
+            band_display = ', '.join(bands_with_zeros[:3])
+            if len(bands_with_zeros) > 3:
+                band_display += f"... +{len(bands_with_zeros)-3} more"
+            
+            st.info(f"✅ {month_name}: Fixed {total_zeros} zero pixels ({band_display})")
+            return True
+        else:
+            # No zeros found - image is already good
+            return True
+            
+    except Exception as e:
+        st.warning(f"⚠️ {month_name}: Error preprocessing zero values - {str(e)}")
+        return False
+
+
 def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir, 
                                 scale=10, status_placeholder=None):
     """
@@ -542,6 +605,7 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
     2. Checks masked pixel percentage
     3. Applies gap-filling if 0% < masked <= 30%
     4. Downloads only if final masked == 0%
+    5. **NEW: Preprocesses to fix zero values**
     
     Returns: (output_path, status, message)
     """
@@ -617,7 +681,13 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
             
             path = download_composite(composite, aoi, output_file, month_name, scale, status_placeholder)
             if path:
-                return path, STATUS_COMPLETE, "Complete (0% masked)"
+                # NEW: Preprocess to fix any zero values
+                if status_placeholder:
+                    status_placeholder.text(f"🔧 {month_name}: Preprocessing zero values...")
+                if preprocess_zero_values(path, month_name):
+                    return path, STATUS_COMPLETE, "Complete (0% masked)"
+                else:
+                    return None, STATUS_REJECTED, "Preprocessing failed"
             else:
                 return None, STATUS_REJECTED, "Download failed"
         
@@ -682,7 +752,13 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
             
             path = download_composite(filled_composite, aoi, output_file, month_name, scale, status_placeholder)
             if path:
-                return path, STATUS_COMPLETE, f"Complete after gap-fill (was {masked_percent:.1f}%)"
+                # NEW: Preprocess to fix any zero values
+                if status_placeholder:
+                    status_placeholder.text(f"🔧 {month_name}: Preprocessing zero values...")
+                if preprocess_zero_values(path, month_name):
+                    return path, STATUS_COMPLETE, f"Complete after gap-fill (was {masked_percent:.1f}%)"
+                else:
+                    return None, STATUS_REJECTED, "Preprocessing failed after gap-fill"
             else:
                 return None, STATUS_REJECTED, "Download failed after gap-fill"
         else:
@@ -1244,6 +1320,8 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                 if os.path.exists(path):
                     is_valid, _ = validate_geotiff_file(path, len(SPECTRAL_BANDS))
                     if is_valid:
+                        # NEW: Ensure cached file is also preprocessed
+                        preprocess_zero_values(path, month_name)
                         downloaded_images[month_name] = path
                         month_statuses[month_name] = {'status': STATUS_COMPLETE, 'message': 'Cached'}
             
@@ -1449,29 +1527,6 @@ def get_image_download_data(image_path, month_name):
         return None
 
 
-# def create_sentinel2_images_zip(downloaded_images):
-#     """
-#     Create a ZIP file containing ALL downloaded Sentinel-2 composite images.
-#     Includes both valid-patch and non-valid-patch months.
-    
-#     Args:
-#         downloaded_images: Dict of {month_name: image_path} - ALL downloaded images
-    
-#     Returns:
-#         BytesIO buffer containing the ZIP file
-#     """
-#     import zipfile
-    
-#     zip_buffer = BytesIO()
-    
-#     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-#         for month_name, image_path in sorted(downloaded_images.items()):
-#             if os.path.exists(image_path):
-#                 # Add file to zip with a clear filename
-#                 zip_file.write(image_path, f"sentinel2_{month_name}_12bands.tif")
-    
-#     zip_buffer.seek(0)
-    # return zip_buffer
 def create_sentinel2_images_zip(downloaded_images, selected_months=None):
     """
     Create a ZIP file containing selected Sentinel-2 composite images.
@@ -1684,13 +1739,13 @@ def main():
 
 def main_classification_tab():
     """Main classification tab content"""
-    st.title("🏗️ Building Classification v06")
+    st.title("🏗️ Building Classification v06 + Zero-Value Preprocessing")
     st.markdown("""
     | Status | Condition | Download? |
     |--------|-----------|-----------|
     | `no_data` | No images | ❌ |
     | `skipped` | masked > 30% | ❌ |
-    | `complete` | masked == 0% | ✅ |
+    | `complete` | masked == 0% | ✅ (+ zero-value preprocessing) |
     | `rejected` | masked > 0% after gap-fill | ❌ |
     """)
     
@@ -2039,10 +2094,6 @@ def main_classification_tab():
             valid_months=st.session_state.valid_months,
             downloaded_images=st.session_state.downloaded_images
         )
-        
-        # Info about change detection tab
-        if st.session_state.probability_maps:
-            st.success(f"✅ Classification complete! {len(st.session_state.probability_maps)} probability maps available. Go to **Change Detection** tab to analyze building changes.")
 
 
 if __name__ == "__main__":
