@@ -1449,12 +1449,13 @@ def get_image_download_data(image_path, month_name):
         return None
 
 
-def create_sentinel2_images_zip(valid_months):
+def create_sentinel2_images_zip(downloaded_images):
     """
-    Create a ZIP file containing all downloaded Sentinel-2 composite images.
+    Create a ZIP file containing ALL downloaded Sentinel-2 composite images.
+    Includes both valid-patch and non-valid-patch months.
     
     Args:
-        valid_months: Dict of {month_name: image_path}
+        downloaded_images: Dict of {month_name: image_path} - ALL downloaded images
     
     Returns:
         BytesIO buffer containing the ZIP file
@@ -1464,7 +1465,7 @@ def create_sentinel2_images_zip(valid_months):
     zip_buffer = BytesIO()
     
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for month_name, image_path in sorted(valid_months.items()):
+        for month_name, image_path in sorted(downloaded_images.items()):
             if os.path.exists(image_path):
                 # Add file to zip with a clear filename
                 zip_file.write(image_path, f"sentinel2_{month_name}_12bands.tif")
@@ -1473,30 +1474,39 @@ def create_sentinel2_images_zip(valid_months):
     return zip_buffer
 
 
-def display_thumbnails(thumbnails, valid_months=None):
+def display_thumbnails(thumbnails, valid_months=None, downloaded_images=None):
     if not thumbnails:
         return
     
     # Add "Download All Sentinel-2 Images" button at the top
-    if valid_months and len(valid_months) > 0:
+    # Use downloaded_images (all images) instead of valid_months (only valid patches)
+    if downloaded_images and len(downloaded_images) > 0:
         st.subheader("📦 Bulk Download")
+        
+        # Show statistics
+        num_valid = len(valid_months) if valid_months else 0
+        num_total = len(downloaded_images)
+        num_excluded = num_total - num_valid
+        
+        st.info(f"📊 **Total downloaded images**: {num_total} | **Valid patches**: {num_valid} | **Excluded**: {num_excluded}")
+        
         col1, col2 = st.columns([1, 3])
         
         with col1:
             if st.button("📦 Prepare ZIP of All Images", type="primary"):
-                with st.spinner(f"Creating ZIP file with {len(valid_months)} Sentinel-2 images..."):
-                    zip_buffer = create_sentinel2_images_zip(valid_months)
+                with st.spinner(f"Creating ZIP file with {num_total} Sentinel-2 images..."):
+                    zip_buffer = create_sentinel2_images_zip(downloaded_images)
                     st.session_state.sentinel2_zip = zip_buffer.getvalue()
                     st.success("✅ ZIP file ready!")
         
         with col2:
             if 'sentinel2_zip' in st.session_state and st.session_state.sentinel2_zip:
                 st.download_button(
-                    label=f"⬇️ Download All Sentinel-2 Images ({len(valid_months)} months)",
+                    label=f"⬇️ Download ALL Sentinel-2 Images ({num_total} months)",
                     data=st.session_state.sentinel2_zip,
-                    file_name=f"sentinel2_all_months_{len(valid_months)}images.zip",
+                    file_name=f"sentinel2_all_months_{num_total}images.zip",
                     mime="application/zip",
-                    help="ZIP file contains all downloaded Sentinel-2 12-band composite images (before classification)"
+                    help=f"ZIP contains ALL {num_total} downloaded Sentinel-2 12-band composite images (both valid-patch and non-valid-patch months, before classification)"
                 )
         
         st.divider()
@@ -1914,7 +1924,8 @@ def main_classification_tab():
         st.header("📊 Results")
         display_thumbnails(
             st.session_state.classification_thumbnails,
-            valid_months=st.session_state.valid_months
+            valid_months=st.session_state.valid_months,
+            downloaded_images=st.session_state.downloaded_images
         )
         
         # Info about change detection tab
