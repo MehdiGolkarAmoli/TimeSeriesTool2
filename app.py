@@ -1469,11 +1469,15 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         plt.close()
         
         # =====================================================================
-        # PHASE 4: Classification (only valid months, with cache)
+        # PHASE 4: Classification (only valid months, with disk cache)
         # =====================================================================
         st.header("Phase 4: Classification")
         
         st.info(f"🧠 Classifying **{len(valid_months)}** months (excluded {excluded_count} with missing patches)")
+        
+        # Create cache directory for classification results
+        classification_cache_dir = os.path.join(temp_dir, "classification_cache")
+        os.makedirs(classification_cache_dir, exist_ok=True)
         
         thumbnails = []
         probability_maps = {}  # Store probability maps for change detection
@@ -1482,15 +1486,32 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         status_text = st.empty()
         
         for idx, month_name in enumerate(month_names):
-            # Check cache
-            if month_name in st.session_state.processed_months:
-                thumbnails.append(st.session_state.processed_months[month_name])
-                # Also check if probability map is cached
-                if month_name in st.session_state.probability_maps:
-                    probability_maps[month_name] = st.session_state.probability_maps[month_name]
-                progress_bar.progress((idx + 1) / len(month_names))
-                continue
+            # Define cache file paths for this month
+            prob_map_cache = os.path.join(classification_cache_dir, f"{month_name}_probmap.npy")
+            thumbnail_cache = os.path.join(classification_cache_dir, f"{month_name}_thumbnail.pkl")
             
+            # Check DISK cache first
+            if os.path.exists(prob_map_cache) and os.path.exists(thumbnail_cache):
+                try:
+                    # Load from disk
+                    prob_map = np.load(prob_map_cache)
+                    import pickle
+                    with open(thumbnail_cache, 'rb') as f:
+                        thumb = pickle.load(f)
+                    
+                    # Add to results
+                    probability_maps[month_name] = prob_map
+                    st.session_state.probability_maps[month_name] = prob_map
+                    thumbnails.append(thumb)
+                    st.session_state.processed_months[month_name] = thumb
+                    
+                    progress_bar.progress((idx + 1) / len(month_names))
+                    continue  # Skip classification, use cached result
+                except Exception as e:
+                    # Cache corrupted, re-classify
+                    st.warning(f"⚠️ {month_name}: Cache corrupted ({e}), re-classifying...")
+            
+            # Otherwise, classify this month
             status_text.text(f"🧠 {month_name} ({idx+1}/{len(month_names)})...")
             
             mask, prob_map, valid_count = classify_image_with_mask(
@@ -1514,6 +1535,15 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                     
                     thumbnails.append(thumb)
                     st.session_state.processed_months[month_name] = thumb
+                    
+                    # Save to DISK cache
+                    try:
+                        np.save(prob_map_cache, prob_map)
+                        import pickle
+                        with open(thumbnail_cache, 'wb') as f:
+                            pickle.dump(thumb, f)
+                    except Exception as e:
+                        st.warning(f"⚠️ {month_name}: Failed to cache results ({e})")
             
             progress_bar.progress((idx + 1) / len(month_names))
         
@@ -1845,9 +1875,9 @@ def main_classification_tab():
     if st.session_state.month_analysis_results:
         cache_info.append(f"📊 {len(st.session_state.month_analysis_results)} months analyzed")
     if st.session_state.downloaded_images:
-        cache_info.append(f"📥 {len(st.session_state.downloaded_images)} images downloaded")
+        cache_info.append(f"📥 {len(st.session_state.downloaded_images)} images downloaded (disk)")
     if st.session_state.processed_months:
-        cache_info.append(f"🧠 {len(st.session_state.processed_months)} months classified")
+        cache_info.append(f"🧠 {len(st.session_state.processed_months)} months classified (disk)")
     
     if cache_info:
         for info in cache_info:
