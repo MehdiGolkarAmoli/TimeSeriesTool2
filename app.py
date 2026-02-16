@@ -23,7 +23,9 @@ GEE SERVER-SIDE:
           * If masked_after > 0%  → "rejected" → SKIP
 
 PYTHON CLIENT-SIDE (after download):
-5. **NEW**: Preprocess to fix zero-value pixels (add 1e-3 to bands with 0)
+5. **NEW**: Preprocess to check zero-value pixels
+   - If >2% of image has zeros → REJECT
+   - Otherwise add 1e-4 to zero values in specific bands
 6. Validate all downloaded images have SAME dimensions
 7. Check patch validity (NaN/zeros) for each month
 8. Find the month with MAXIMUM valid patches (reference)
@@ -33,7 +35,7 @@ PYTHON CLIENT-SIDE (after download):
 GUARANTEES:
 ═══════════════════════════════════════════════════════════════════════════════
 ✅ All downloaded images have 0% masked pixels (GEE-side guarantee)
-✅ All downloaded images have NO zero-value pixels in any band (preprocessing)
+✅ All downloaded images with <2% zeros have NO zero-value pixels (preprocessing)
 ✅ All downloaded images have identical dimensions (validated in Python)
 ✅ All classified months have SAME valid patches (reference mask)
 ✅ Months with missing patches are EXCLUDED (not reduced to minimum)
@@ -105,6 +107,10 @@ CDI_THRESHOLD = -0.5
 # Gap-filling threshold
 MAX_MASKED_PERCENT_FOR_GAPFILL = 30
 
+# Zero-value preprocessing thresholds
+ZERO_VALUE_REPLACEMENT = 1e-4  # Value to add to zero pixels
+MAX_ZERO_PERCENT = 2.0  # Maximum percentage of zeros allowed (2%)
+
 # Status constants
 STATUS_NO_DATA = "no_data"
 STATUS_SKIPPED = "skipped"
@@ -162,9 +168,13 @@ if 'processing_in_progress' not in st.session_state:
     st.session_state.processing_in_progress = False
 if 'processing_config' not in st.session_state:
     st.session_state.processing_config = None
-# For bulk download
-if 'sentinel2_zip' not in st.session_state:
-    st.session_state.sentinel2_zip = None
+# NEW: For change detection
+if 'probability_maps' not in st.session_state:
+    st.session_state.probability_maps = {}
+if 'change_detection_result' not in st.session_state:
+    st.session_state.change_detection_result = None
+if 'change_timing_map' not in st.session_state:
+    st.session_state.change_timing_map = None
 
 
 # =============================================================================
@@ -176,7 +186,7 @@ def normalized(img):
     max_val = np.nanmax(img)
     if max_val == min_val:
         return np.zeros_like(img)
-    return (img - min_val) / (max_val - min_val + 1e-3)
+    return (img - min_val) / (max_val - min_val + 1e-5)
 
 
 # =============================================================================
@@ -538,18 +548,20 @@ def download_composite(composite, aoi, output_path, month_name, scale=10, status
 # =============================================================================
 def preprocess_zero_values(image_path, month_name):
     """
-    Check each pixel and add 1e-3 to any band that has a value of 0.
-    Modifies the image file in-place.
+    Check and preprocess zero values in the image.
     
-    This ensures no pixel has zero value in any band before patching,
-    which can cause issues during classification.
+    Algorithm:
+    1. Count total zero values across all bands
+    2. If >2% of image has zeros → REJECT (return False)
+    3. Otherwise, add 1e-4 to pixels with zero values in specific bands
+    4. Modify file in-place
     
     Args:
         image_path: Path to the GeoTIFF file
         month_name: Name of the month (for logging)
     
     Returns:
-        True if preprocessing was successful, False otherwise
+        True if preprocessing successful (or no zeros), False if rejected (>2% zeros)
     """
     try:
         # Read the image
@@ -557,13 +569,25 @@ def preprocess_zero_values(image_path, month_name):
             img_data = src.read()  # Shape: (bands, height, width)
             profile = src.profile
         
+        # Calculate total number of values
+        total_values = img_data.size  # bands * height * width
+        
         # Create mask where values are exactly 0
         zero_mask = (img_data == 0)
+        total_zeros = np.sum(zero_mask)
         
-        if np.any(zero_mask):
+        # Calculate percentage of zeros
+        zero_percent = (total_zeros / total_values) * 100
+        
+        # CHECK: If >2% zeros, REJECT the image
+        if zero_percent > MAX_ZERO_PERCENT:
+            st.warning(f"❌ {month_name}: REJECTED - Too many zero values ({zero_percent:.2f}% > {MAX_ZERO_PERCENT}%)")
+            return False
+        
+        # If we have zeros but <=2%, fix them
+        if total_zeros > 0:
             # Count zeros per band for logging
             zeros_per_band = np.sum(zero_mask, axis=(1, 2))
-            total_zeros = np.sum(zeros_per_band)
             
             # Log which bands have zeros (show first 3 bands)
             bands_with_zeros = []
@@ -571,8 +595,8 @@ def preprocess_zero_values(image_path, month_name):
                 if zeros_per_band[i] > 0:
                     bands_with_zeros.append(f"Band{i+1}:{int(zeros_per_band[i])}")
             
-            # Add 1e-3 to zero values (only affects pixels with 0 in specific bands)
-            img_data[zero_mask] = 1e-3
+            # Add 1e-4 to zero values (only affects pixels with 0 in specific bands)
+            img_data[zero_mask] = ZERO_VALUE_REPLACEMENT
             
             # Write corrected data back to file
             with rasterio.open(image_path, 'w', **profile) as dst:
@@ -583,11 +607,10 @@ def preprocess_zero_values(image_path, month_name):
             if len(bands_with_zeros) > 3:
                 band_display += f"... +{len(bands_with_zeros)-3} more"
             
-            st.info(f"✅ {month_name}: Fixed {total_zeros} zero pixels ({band_display})")
-            return True
-        else:
-            # No zeros found - image is already good
-            return True
+            st.info(f"✅ {month_name}: Fixed {total_zeros} zero pixels ({zero_percent:.2f}%) - {band_display}")
+        
+        # No zeros or successfully fixed
+        return True
             
     except Exception as e:
         st.warning(f"⚠️ {month_name}: Error preprocessing zero values - {str(e)}")
@@ -597,7 +620,7 @@ def preprocess_zero_values(image_path, month_name):
 def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir, 
                                 scale=10, status_placeholder=None):
     """
-    Download a single monthly composite with gap-filling.
+    Download a single monthly composite with gap-filling and zero-value preprocessing.
     Creates composite fresh inside function (like v05) but with v06 cloud masking.
     
     This function:
@@ -605,7 +628,7 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
     2. Checks masked pixel percentage
     3. Applies gap-filling if 0% < masked <= 30%
     4. Downloads only if final masked == 0%
-    5. **NEW: Preprocesses to fix zero values**
+    5. **NEW: Preprocesses to check/fix zero values (reject if >2%)**
     
     Returns: (output_path, status, message)
     """
@@ -681,13 +704,16 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
             
             path = download_composite(composite, aoi, output_file, month_name, scale, status_placeholder)
             if path:
-                # NEW: Preprocess to fix any zero values
+                # NEW: Preprocess to check/fix zero values
                 if status_placeholder:
-                    status_placeholder.text(f"🔧 {month_name}: Preprocessing zero values...")
+                    status_placeholder.text(f"🔧 {month_name}: Checking zero values...")
                 if preprocess_zero_values(path, month_name):
                     return path, STATUS_COMPLETE, "Complete (0% masked)"
                 else:
-                    return None, STATUS_REJECTED, "Preprocessing failed"
+                    # Image rejected due to >2% zeros
+                    if os.path.exists(path):
+                        os.remove(path)
+                    return None, STATUS_REJECTED, "Too many zero values (>2%)"
             else:
                 return None, STATUS_REJECTED, "Download failed"
         
@@ -752,13 +778,16 @@ def download_monthly_image_v06(aoi, cloud_free_collection, month_info, temp_dir,
             
             path = download_composite(filled_composite, aoi, output_file, month_name, scale, status_placeholder)
             if path:
-                # NEW: Preprocess to fix any zero values
+                # NEW: Preprocess to check/fix zero values
                 if status_placeholder:
-                    status_placeholder.text(f"🔧 {month_name}: Preprocessing zero values...")
+                    status_placeholder.text(f"🔧 {month_name}: Checking zero values...")
                 if preprocess_zero_values(path, month_name):
                     return path, STATUS_COMPLETE, f"Complete after gap-fill (was {masked_percent:.1f}%)"
                 else:
-                    return None, STATUS_REJECTED, "Preprocessing failed after gap-fill"
+                    # Image rejected due to >2% zeros
+                    if os.path.exists(path):
+                        os.remove(path)
+                    return None, STATUS_REJECTED, "Too many zero values (>2%) after gap-fill"
             else:
                 return None, STATUS_REJECTED, "Download failed after gap-fill"
         else:
@@ -1320,8 +1349,6 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                 if os.path.exists(path):
                     is_valid, _ = validate_geotiff_file(path, len(SPECTRAL_BANDS))
                     if is_valid:
-                        # NEW: Ensure cached file is also preprocessed
-                        preprocess_zero_values(path, month_name)
                         downloaded_images[month_name] = path
                         month_statuses[month_name] = {'status': STATUS_COMPLETE, 'message': 'Cached'}
             
@@ -1449,6 +1476,7 @@ def process_timeseries(aoi, start_date, end_date, model, device,
         st.info(f"🧠 Classifying **{len(valid_months)}** months (excluded {excluded_count} with missing patches)")
         
         thumbnails = []
+        probability_maps = {}  # Store probability maps for change detection
         month_names = sorted(valid_months.keys())  # Use valid_months, not downloaded_images
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -1457,6 +1485,9 @@ def process_timeseries(aoi, start_date, end_date, model, device,
             # Check cache
             if month_name in st.session_state.processed_months:
                 thumbnails.append(st.session_state.processed_months[month_name])
+                # Also check if probability map is cached
+                if month_name in st.session_state.probability_maps:
+                    probability_maps[month_name] = st.session_state.probability_maps[month_name]
                 progress_bar.progress((idx + 1) / len(month_names))
                 continue
             
@@ -1467,6 +1498,10 @@ def process_timeseries(aoi, start_date, end_date, model, device,
             )
             
             if mask is not None:
+                # Store probability map for change detection
+                probability_maps[month_name] = prob_map
+                st.session_state.probability_maps[month_name] = prob_map
+                
                 thumb = generate_thumbnails(
                     valid_months[month_name], mask, month_name,
                     valid_mask=valid_mask, original_size=original_size
@@ -1500,6 +1535,9 @@ def process_timeseries(aoi, start_date, end_date, model, device,
                     # Also remove from valid_months
                     if t['month_name'] in st.session_state.valid_months:
                         del st.session_state.valid_months[t['month_name']]
+                    # Also remove from probability_maps for change detection
+                    if t['month_name'] in st.session_state.probability_maps:
+                        del st.session_state.probability_maps[t['month_name']]
                 else:
                     filtered_thumbnails.append(t)
             
@@ -1515,6 +1553,161 @@ def process_timeseries(aoi, start_date, end_date, model, device,
 
 
 # =============================================================================
+# Change Detection Algorithm
+# =============================================================================
+def analyze_building_transition(probability_maps, non_building_thr=0.2, building_thr=0.8,
+                                non_building_duration=2, building_duration=2):
+    """
+    Analyze building transition based on time series of probability maps.
+    
+    Algorithm:
+    - Pixel must START as non-building (< non_building_thr)
+    - Pixel must END as building (>= building_thr)
+    - Only ONE transition from non-building to building allowed (no back-and-forth)
+    - Must stay non-building for at least `non_building_duration` images before transition
+    - Must stay building for at least `building_duration` images after transition
+    
+    Args:
+        probability_maps: Dict of {month_name: probability_array}
+        non_building_thr: Threshold below which pixel is non-building (default 0.2)
+        building_thr: Threshold above which pixel is building (default 0.8)
+        non_building_duration: Min months as non-building before transition (default 2)
+        building_duration: Min months as building after transition (default 2)
+    
+    Returns:
+        change_mask: Binary array where 1 = change detected
+        stats: Dictionary with statistics
+    """
+    # Sort months chronologically
+    sorted_months = sorted(probability_maps.keys())
+    
+    if len(sorted_months) < (non_building_duration + building_duration):
+        return None, None, {"error": f"Need at least {non_building_duration + building_duration} months, got {len(sorted_months)}"}
+    
+    # Stack probability maps into 3D array (time, height, width)
+    first_map = probability_maps[sorted_months[0]]
+    height, width = first_map.shape
+    n_times = len(sorted_months)
+    
+    data = np.zeros((n_times, height, width), dtype=np.float32)
+    for i, month in enumerate(sorted_months):
+        data[i] = probability_maps[month]
+    
+    # Initialize results
+    results = np.zeros((height, width), dtype=np.uint8)
+    # NEW: Track which month each pixel transitioned (0 = no transition, 1-N = month index)
+    transition_timing = np.zeros((height, width), dtype=np.int16)
+    
+    # Process each pixel
+    for y in range(height):
+        for x in range(width):
+            pixel_series = data[:, y, x]
+            
+            # Skip if pixel is all zeros (invalid/masked area)
+            if np.all(pixel_series == 0):
+                continue
+            
+            # CHECK 1: Pixel must start as non-building
+            if pixel_series[0] > non_building_thr:
+                continue
+            
+            # CHECK 2: Pixel must end as building
+            if pixel_series[-1] < building_thr:
+                continue
+            
+            # Find the transition point from non-building to building
+            transition_point = None
+            invalid_transition = False
+            
+            for t in range(1, len(pixel_series)):
+                # Check for invalid backward transitions
+                # If pixel was above non_building_thr and goes back below
+                if pixel_series[t-1] > non_building_thr and pixel_series[t] <= non_building_thr:
+                    invalid_transition = True
+                    break
+                # If pixel was above building_thr and goes back below
+                elif pixel_series[t-1] >= building_thr and pixel_series[t] < building_thr:
+                    invalid_transition = True
+                    break
+                
+                # Detect the transition point (first time going from non-building to building)
+                if (pixel_series[t-1] <= non_building_thr and 
+                    pixel_series[t] >= building_thr and 
+                    transition_point is None):
+                    transition_point = t
+            
+            # Check if we found a valid transition
+            if transition_point is not None and not invalid_transition:
+                # Check duration constraints
+                nb_duration = transition_point  # Duration before transition
+                b_duration = len(pixel_series) - transition_point  # Duration after transition
+                
+                if (nb_duration >= non_building_duration and 
+                    b_duration >= building_duration):
+                    results[y, x] = 1
+                    transition_timing[y, x] = transition_point  # Store the month index
+    
+    # Calculate statistics
+    change_pixels = np.sum(results == 1)
+    total_pixels = np.sum(data[0] > 0)  # Count non-zero pixels
+    change_percentage = (change_pixels / total_pixels * 100) if total_pixels > 0 else 0
+    
+    # Calculate per-month transition statistics
+    transition_by_month = {}
+    for i, month in enumerate(sorted_months):
+        if i > 0:  # Skip first month (can't transition TO first month)
+            count = np.sum(transition_timing == i)
+            transition_by_month[month] = int(count)
+    
+    stats = {
+        'change_pixels': int(change_pixels),
+        'total_pixels': int(total_pixels),
+        'change_percentage': float(change_percentage),
+        'n_months': n_times,
+        'months': sorted_months,
+        'first_month': sorted_months[0],
+        'last_month': sorted_months[-1],
+        'transition_by_month': transition_by_month
+    }
+    
+    # Store timing map in session state for later use
+    st.session_state.change_timing_map = transition_timing
+    
+    return results, transition_timing, stats
+
+
+def generate_rgb_from_sentinel(image_path, max_size=None):
+    """Generate RGB image from Sentinel-2 bands for display."""
+    try:
+        with rasterio.open(image_path) as src:
+            red = src.read(4)
+            green = src.read(3)
+            blue = src.read(2)
+            
+            rgb = np.stack([red, green, blue], axis=-1)
+            rgb = np.nan_to_num(rgb, nan=0.0)
+            
+            def percentile_stretch(band, lower=2, upper=98):
+                valid = band[band > 0]
+                if len(valid) == 0:
+                    return np.zeros_like(band, dtype=np.uint8)
+                p_low = np.percentile(valid, lower)
+                p_high = np.percentile(valid, upper)
+                if p_high <= p_low:
+                    p_high = p_low + 0.001
+                stretched = np.clip((band - p_low) / (p_high - p_low), 0, 1)
+                return (stretched * 255).astype(np.uint8)
+            
+            rgb_uint8 = np.zeros_like(rgb, dtype=np.uint8)
+            for i in range(3):
+                rgb_uint8[:, :, i] = percentile_stretch(rgb[:, :, i])
+            
+            return rgb_uint8
+    except:
+        return None
+
+
+# =============================================================================
 # Display Thumbnails
 # =============================================================================
 def get_image_download_data(image_path, month_name):
@@ -1527,157 +1720,10 @@ def get_image_download_data(image_path, month_name):
         return None
 
 
-def create_sentinel2_images_zip(downloaded_images, selected_months=None):
-    """
-    Create a ZIP file containing selected Sentinel-2 composite images.
-    
-    Args:
-        downloaded_images: Dict of {month_name: image_path} - ALL downloaded images
-        selected_months: List of month names to include (None = all months)
-    
-    Returns:
-        BytesIO buffer containing the ZIP file
-    """
-    import zipfile
-    
-    zip_buffer = BytesIO()
-    
-    # Filter months if selection provided
-    months_to_zip = downloaded_images
-    if selected_months is not None:
-        months_to_zip = {k: v for k, v in downloaded_images.items() if k in selected_months}
-    
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for month_name, image_path in sorted(months_to_zip.items()):
-            if os.path.exists(image_path):
-                # Add file to zip with a clear filename
-                zip_file.write(image_path, f"sentinel2_{month_name}_12bands.tif")
-    
-    zip_buffer.seek(0)
-    return zip_buffer
-
-
-def display_thumbnails(thumbnails, valid_months=None, downloaded_images=None):
+def display_thumbnails(thumbnails, valid_months=None):
     if not thumbnails:
         return
     
-    # Add "Download All Sentinel-2 Images" section at the top
-    if downloaded_images and len(downloaded_images) > 0:
-        st.subheader("📦 Bulk Download Sentinel-2 Images")
-        
-        # Categorize months
-        included_months = set(valid_months.keys()) if valid_months else set()
-        excluded_months = set(downloaded_images.keys()) - included_months
-        
-        num_included = len(included_months)
-        num_excluded = len(excluded_months)
-        num_total = len(downloaded_images)
-        
-        # Show statistics
-        col1, col2, col3 = st.columns(3)
-        col1.metric("✅ Included (Valid Patches)", num_included)
-        col2.metric("❌ Excluded (Missing Patches)", num_excluded)
-        col3.metric("📊 Total Downloaded", num_total)
-        
-        st.divider()
-        
-        # Month selection interface
-        st.write("**Select months to download:**")
-        
-        # Selection mode
-        selection_mode = st.radio(
-            "Selection Mode:",
-            ["All Months", "Included Only", "Excluded Only", "Custom Selection"],
-            horizontal=True,
-            help="Choose which months to include in the ZIP file"
-        )
-        
-        selected_months = None
-        
-        if selection_mode == "All Months":
-            selected_months = list(downloaded_images.keys())
-            st.info(f"📦 Will download **all {num_total} months** (included + excluded)")
-            
-        elif selection_mode == "Included Only":
-            selected_months = sorted(included_months)
-            st.success(f"✅ Will download **{num_included} included months** (with valid patches)")
-            with st.expander("📋 View included months"):
-                st.write(", ".join(selected_months))
-            
-        elif selection_mode == "Excluded Only":
-            selected_months = sorted(excluded_months)
-            st.warning(f"❌ Will download **{num_excluded} excluded months** (with missing patches)")
-            with st.expander("📋 View excluded months"):
-                st.write(", ".join(selected_months))
-            
-        elif selection_mode == "Custom Selection":
-            st.write("**Included Months (Valid Patches):**")
-            selected_included = []
-            if included_months:
-                cols_included = st.columns(min(4, len(included_months)))
-                for idx, month in enumerate(sorted(included_months)):
-                    with cols_included[idx % len(cols_included)]:
-                        if st.checkbox(month, value=True, key=f"inc_{month}"):
-                            selected_included.append(month)
-            
-            st.write("**Excluded Months (Missing Patches):**")
-            selected_excluded = []
-            if excluded_months:
-                cols_excluded = st.columns(min(4, len(excluded_months)))
-                for idx, month in enumerate(sorted(excluded_months)):
-                    with cols_excluded[idx % len(cols_excluded)]:
-                        if st.checkbox(month, value=False, key=f"exc_{month}"):
-                            selected_excluded.append(month)
-            
-            selected_months = selected_included + selected_excluded
-            st.info(f"📦 Selected **{len(selected_months)}** months: {len(selected_included)} included + {len(selected_excluded)} excluded")
-        
-        # Download button
-        st.divider()
-        
-        col1, col2 = st.columns([1, 2])
-        
-        with col1:
-            prepare_clicked = st.button(
-                f"📦 Prepare ZIP ({len(selected_months)} months)", 
-                type="primary",
-                disabled=not selected_months
-            )
-            
-            if prepare_clicked:
-                with st.spinner(f"Creating ZIP file with {len(selected_months)} Sentinel-2 images..."):
-                    zip_buffer = create_sentinel2_images_zip(downloaded_images, selected_months)
-                    st.session_state.sentinel2_zip = zip_buffer.getvalue()
-                    st.session_state.sentinel2_zip_info = {
-                        'num_months': len(selected_months),
-                        'month_list': selected_months,
-                        'selection_mode': selection_mode
-                    }
-                    st.success("✅ ZIP file ready!")
-        
-        with col2:
-            if 'sentinel2_zip' in st.session_state and st.session_state.sentinel2_zip:
-                zip_info = st.session_state.get('sentinel2_zip_info', {})
-                num_in_zip = zip_info.get('num_months', num_total)
-                mode_label = zip_info.get('selection_mode', 'Custom')
-                
-                st.download_button(
-                    label=f"⬇️ Download Sentinel-2 Images ({num_in_zip} months)",
-                    data=st.session_state.sentinel2_zip,
-                    file_name=f"sentinel2_{mode_label.lower().replace(' ', '_')}_{num_in_zip}months.zip",
-                    mime="application/zip",
-                    help=f"ZIP contains {num_in_zip} Sentinel-2 12-band composite images"
-                )
-                
-                # Show what's in the ZIP
-                if zip_info.get('month_list'):
-                    with st.expander(f"📋 Contents ({num_in_zip} months)"):
-                        months_display = ", ".join(sorted(zip_info['month_list']))
-                        st.text(months_display)
-        
-        st.divider()
-    
-    # Rest of the thumbnail display code remains the same
     mode = st.radio("Display:", ["Side by Side", "Classification", "RGB"], horizontal=True)
     st.divider()
     
@@ -1734,7 +1780,14 @@ def display_thumbnails(thumbnails, valid_months=None, downloaded_images=None):
 # Main Application
 # =============================================================================
 def main():
-    main_classification_tab()
+    # Create tabs for the application
+    tab1, tab2 = st.tabs(["🏗️ Classification", "🔍 Change Detection"])
+    
+    with tab1:
+        main_classification_tab()
+    
+    with tab2:
+        change_detection_tab()
 
 
 def main_classification_tab():
@@ -1745,8 +1798,8 @@ def main_classification_tab():
     |--------|-----------|-----------|
     | `no_data` | No images | ❌ |
     | `skipped` | masked > 30% | ❌ |
-    | `complete` | masked == 0% | ✅ (+ zero-value preprocessing) |
-    | `rejected` | masked > 0% after gap-fill | ❌ |
+    | `complete` | masked == 0% | ✅ (+ zero check: reject if >2% zeros) |
+    | `rejected` | masked > 0% after gap-fill OR >2% zeros | ❌ |
     """)
     
     ee_ok, ee_msg = initialize_earth_engine()
@@ -1814,7 +1867,7 @@ def main_classification_tab():
                     'valid_patches_mask', 'valid_months', 'current_temp_dir', 'month_analysis_results',
                     'failed_downloads', 'analysis_complete', 'download_complete',
                     'processing_params', 'processing_config', 'pdf_report',
-                    'sentinel2_zip']:
+                    'probability_maps', 'change_detection_result', 'change_timing_map']:
             if key in st.session_state:
                 if isinstance(st.session_state[key], dict):
                     st.session_state[key] = {}
@@ -1997,7 +2050,8 @@ def main_classification_tab():
         st.session_state.pdf_report = None
         st.session_state.failed_downloads = []
         st.session_state.processing_complete = False
-        st.session_state.sentinel2_zip = None
+        st.session_state.probability_maps = {}
+        st.session_state.change_detection_result = None
         
         # Store processing config
         st.session_state.processing_config = {
@@ -2091,9 +2145,342 @@ def main_classification_tab():
         st.header("📊 Results")
         display_thumbnails(
             st.session_state.classification_thumbnails,
-            valid_months=st.session_state.valid_months,
-            downloaded_images=st.session_state.downloaded_images
+            valid_months=st.session_state.valid_months
         )
+        
+        # Info about change detection tab
+        if st.session_state.probability_maps:
+            st.success(f"✅ Classification complete! {len(st.session_state.probability_maps)} probability maps available. Go to **Change Detection** tab to analyze building changes.")
+
+
+def change_detection_tab():
+    """Change Detection Analysis Tab"""
+    st.title("🔍 Change Detection Analysis")
+    
+    # Check if we have probability maps
+    if not st.session_state.probability_maps:
+        st.warning("⚠️ No probability maps available. Please complete classification in the **Classification** tab first.")
+        st.info("The change detection algorithm requires probability maps from the building classification.")
+        return
+    
+    n_months = len(st.session_state.probability_maps)
+    sorted_months = sorted(st.session_state.probability_maps.keys())
+    
+    st.success(f"✅ **{n_months} months** of probability maps available: {sorted_months[0]} → {sorted_months[-1]}")
+    
+    # =================================================================
+    # PARAMETERS SECTION
+    # =================================================================
+    st.header("⚙️ Algorithm Parameters")
+    
+    # Algorithm explanation
+    with st.expander("ℹ️ Algorithm Explanation", expanded=False):
+        st.markdown("""
+        **Change Detection Algorithm:**
+        
+        A pixel is considered a "change" (non-building → building) if:
+        
+        1. ✅ Pixel **starts** as non-building (probability < non-building threshold)
+        2. ✅ Pixel **ends** as building (probability > building threshold)
+        3. ✅ Only **ONE transition** from non-building to building (no back-and-forth fluctuations)
+        4. ✅ Stays non-building for at least **min non-building duration** months before transition
+        5. ✅ Stays building for at least **min building duration** months after transition
+        
+        This ensures we detect **reliable, persistent** changes and filter out model noise.
+        """)
+    
+    # Parameters in two columns with text inputs
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📊 Thresholds")
+        non_building_thr = st.text_input(
+            "Non-building threshold",
+            value="0.2",
+            help="Pixels with probability BELOW this value are considered non-building (0.0 - 0.5)",
+            key="cd_non_building_thr"
+        )
+        building_thr = st.text_input(
+            "Building threshold",
+            value="0.8",
+            help="Pixels with probability ABOVE this value are considered building (0.5 - 1.0)",
+            key="cd_building_thr"
+        )
+    
+    with col2:
+        st.subheader("⏱️ Duration Constraints")
+        min_non_building = st.text_input(
+            "Min non-building duration (months)",
+            value="2",
+            help="Pixel must stay as non-building for at least this many months at the START",
+            key="cd_min_non_building"
+        )
+        min_building = st.text_input(
+            "Min building duration (months)",
+            value="2",
+            help="Pixel must stay as building for at least this many months at the END",
+            key="cd_min_building"
+        )
+    
+    # Validate inputs
+    try:
+        non_building_thr_val = float(non_building_thr)
+        building_thr_val = float(building_thr)
+        min_non_building_val = int(min_non_building)
+        min_building_val = int(min_building)
+        
+        # Validation checks
+        errors = []
+        if not (0.0 <= non_building_thr_val <= 0.5):
+            errors.append("Non-building threshold must be between 0.0 and 0.5")
+        if not (0.5 <= building_thr_val <= 1.0):
+            errors.append("Building threshold must be between 0.5 and 1.0")
+        if min_non_building_val < 1:
+            errors.append("Min non-building duration must be at least 1")
+        if min_building_val < 1:
+            errors.append("Min building duration must be at least 1")
+        if min_non_building_val + min_building_val > n_months:
+            errors.append(f"Total duration ({min_non_building_val + min_building_val}) exceeds available months ({n_months})")
+        
+        if errors:
+            for err in errors:
+                st.error(f"❌ {err}")
+            params_valid = False
+        else:
+            params_valid = True
+            st.info(f"📊 Parameters: non-building < {non_building_thr_val}, building > {building_thr_val}, min NB duration = {min_non_building_val}, min B duration = {min_building_val}")
+    
+    except ValueError as e:
+        st.error(f"❌ Invalid parameter value. Please enter valid numbers.")
+        params_valid = False
+    
+    # =================================================================
+    # RUN CHANGE DETECTION
+    # =================================================================
+    st.divider()
+    
+    if params_valid:
+        if st.button("🔍 Run Change Detection", type="primary", use_container_width=True):
+            with st.spinner("Analyzing building transitions across time series..."):
+                # Run change detection
+                change_mask, timing_map, stats = analyze_building_transition(
+                    st.session_state.probability_maps,
+                    non_building_thr=non_building_thr_val,
+                    building_thr=building_thr_val,
+                    non_building_duration=min_non_building_val,
+                    building_duration=min_building_val
+                )
+                
+                if change_mask is not None:
+                    st.session_state.change_detection_result = {
+                        'mask': change_mask,
+                        'timing_map': timing_map,
+                        'stats': stats,
+                        'params': {
+                            'non_building_thr': non_building_thr_val,
+                            'building_thr': building_thr_val,
+                            'min_non_building': min_non_building_val,
+                            'min_building': min_building_val
+                        }
+                    }
+                    st.success("✅ Change detection completed!")
+                    st.rerun()
+                else:
+                    st.error(f"❌ Change detection failed: {stats.get('error', 'Unknown error') if stats else 'Unknown error'}")
+    
+    # =================================================================
+    # DISPLAY RESULTS
+    # =================================================================
+    if st.session_state.change_detection_result:
+        result = st.session_state.change_detection_result
+        change_mask = result['mask']
+        stats = result['stats']
+        params = result['params']
+        
+        st.divider()
+        st.header("📈 Change Detection Results")
+        
+        # Statistics
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Change Pixels", f"{stats['change_pixels']:,}")
+        col2.metric("Total Pixels", f"{stats['total_pixels']:,}")
+        col3.metric("Change Rate", f"{stats['change_percentage']:.2f}%")
+        col4.metric("Months Analyzed", stats['n_months'])
+        
+        st.info(f"📅 Time range: **{stats['first_month']}** → **{stats['last_month']}**")
+        
+        # Display transition statistics by month
+        transition_by_month = stats.get('transition_by_month', {})
+        if transition_by_month:
+            with st.expander("📊 Transitions by Month", expanded=False):
+                for month, count in transition_by_month.items():
+                    if count > 0:
+                        st.write(f"  • **{month}**: {count:,} pixels transitioned")
+        
+        # =================================================================
+        # VISUALIZATION
+        # =================================================================
+        st.subheader("🖼️ Results Visualization")
+        
+        # Get first and last month images
+        first_month = stats['first_month']
+        last_month = stats['last_month']
+        
+        first_image_path = st.session_state.valid_months.get(first_month)
+        last_image_path = st.session_state.valid_months.get(last_month)
+        
+        # Get valid patch bounds for cropping
+        valid_mask = st.session_state.valid_patches_mask
+        original_size = change_mask.shape
+        crop_bounds = get_valid_patch_bounds(valid_mask, PATCH_SIZE, original_size)
+        
+        # Generate RGB images
+        first_rgb = generate_rgb_from_sentinel(first_image_path) if first_image_path else None
+        last_rgb = generate_rgb_from_sentinel(last_image_path) if last_image_path else None
+        
+        # Get first and last classification masks
+        first_prob = st.session_state.probability_maps.get(first_month)
+        last_prob = st.session_state.probability_maps.get(last_month)
+        first_class = (first_prob > 0.5).astype(np.uint8) * 255 if first_prob is not None else None
+        last_class = (last_prob > 0.5).astype(np.uint8) * 255 if last_prob is not None else None
+        
+        if first_rgb is not None and last_rgb is not None and crop_bounds is not None:
+            row_start, row_end, col_start, col_end = crop_bounds
+            
+            # Crop images to valid area
+            first_rgb_cropped = first_rgb[row_start:row_end, col_start:col_end, :]
+            last_rgb_cropped = last_rgb[row_start:row_end, col_start:col_end, :]
+            change_mask_cropped = change_mask[row_start:row_end, col_start:col_end]
+            first_class_cropped = first_class[row_start:row_end, col_start:col_end] if first_class is not None else None
+            last_class_cropped = last_class[row_start:row_end, col_start:col_end] if last_class is not None else None
+            
+            # Create figure with 2 rows
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            
+            # Row 1: RGB images and change mask
+            axes[0, 0].imshow(first_rgb_cropped)
+            axes[0, 0].set_title(f"First RGB: {first_month}", fontsize=12)
+            axes[0, 0].axis('off')
+            
+            axes[0, 1].imshow(last_rgb_cropped)
+            axes[0, 1].set_title(f"Last RGB: {last_month}", fontsize=12)
+            axes[0, 1].axis('off')
+            
+            # Change detection overlay
+            change_color = np.zeros((*change_mask_cropped.shape, 3), dtype=np.uint8)
+            change_color[change_mask_cropped == 1] = [255, 0, 0]  # Red for change
+            axes[0, 2].imshow(last_rgb_cropped)
+            axes[0, 2].imshow(change_color, alpha=0.6)
+            axes[0, 2].set_title(f"Change Detection\n({stats['change_pixels']:,} pixels)", fontsize=12)
+            axes[0, 2].axis('off')
+            
+            # Row 2: Classification masks
+            if first_class_cropped is not None:
+                axes[1, 0].imshow(first_class_cropped, cmap='Greens')
+                axes[1, 0].set_title(f"First Classification: {first_month}", fontsize=12)
+                axes[1, 0].axis('off')
+            
+            if last_class_cropped is not None:
+                axes[1, 1].imshow(last_class_cropped, cmap='Reds')
+                axes[1, 1].set_title(f"Last Classification: {last_month}", fontsize=12)
+                axes[1, 1].axis('off')
+            
+            # Change mask only
+            axes[1, 2].imshow(change_mask_cropped, cmap='hot')
+            axes[1, 2].set_title(f"Change Mask\n({stats['change_percentage']:.2f}% change)", fontsize=12)
+            axes[1, 2].axis('off')
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+            
+            # =================================================================
+            # DOWNLOAD SECTION
+            # =================================================================
+            st.subheader("⬇️ Download Results")
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                # Save change mask as GeoTIFF with coordinates
+                if first_image_path and os.path.exists(first_image_path):
+                    try:
+                        with rasterio.open(first_image_path) as src:
+                            # Get the transform and CRS from the original image
+                            out_meta = src.meta.copy()
+                            out_meta.update({
+                                'count': 1,
+                                'dtype': 'uint8',
+                                'height': change_mask.shape[0],
+                                'width': change_mask.shape[1]
+                            })
+                            
+                            # Create GeoTIFF in memory
+                            geotiff_buffer = BytesIO()
+                            with rasterio.open(geotiff_buffer, 'w', **out_meta) as dst:
+                                dst.write(change_mask.astype(np.uint8), 1)
+                            
+                            geotiff_buffer.seek(0)
+                            st.download_button(
+                                label="📥 Download Change Mask (GeoTIFF)",
+                                data=geotiff_buffer.getvalue(),
+                                file_name=f"change_detection_{first_month}_to_{last_month}.tif",
+                                mime="image/tiff"
+                            )
+                    except Exception as e:
+                        st.error(f"Error creating GeoTIFF: {e}")
+                        # Fallback to PNG
+                        change_img = Image.fromarray((change_mask_cropped * 255).astype(np.uint8))
+                        buf = BytesIO()
+                        change_img.save(buf, format='PNG')
+                        buf.seek(0)
+                        st.download_button(
+                            label="📥 Download Change Mask (PNG)",
+                            data=buf.getvalue(),
+                            file_name=f"change_detection_{first_month}_to_{last_month}.png",
+                            mime="image/png"
+                        )
+            
+            with col2:
+                # Download cropped change mask as PNG for quick viewing
+                change_img = Image.fromarray((change_mask_cropped * 255).astype(np.uint8))
+                buf = BytesIO()
+                change_img.save(buf, format='PNG')
+                buf.seek(0)
+                st.download_button(
+                    label="📥 Download Cropped Preview (PNG)",
+                    data=buf.getvalue(),
+                    file_name=f"change_preview_{first_month}_to_{last_month}.png",
+                    mime="image/png"
+                )
+            
+            with col3:
+                # Save parameters and stats as text
+                report_text = f"""Change Detection Report
+================================
+Time Range: {first_month} to {last_month}
+Months Analyzed: {stats['n_months']}
+
+Parameters:
+- Non-building threshold: {params['non_building_thr']}
+- Building threshold: {params['building_thr']}
+- Min non-building duration: {params['min_non_building']} months
+- Min building duration: {params['min_building']} months
+
+Results:
+- Change pixels: {stats['change_pixels']:,}
+- Total valid pixels: {stats['total_pixels']:,}
+- Change rate: {stats['change_percentage']:.4f}%
+"""
+                st.download_button(
+                    label="📄 Download Report (TXT)",
+                    data=report_text,
+                    file_name=f"change_detection_report_{first_month}_to_{last_month}.txt",
+                    mime="text/plain"
+                )
+        
+        else:
+            st.error("❌ Could not generate visualization. RGB images or crop bounds not available.")
 
 
 if __name__ == "__main__":
