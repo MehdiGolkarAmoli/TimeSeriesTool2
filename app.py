@@ -2153,6 +2153,462 @@ def main_classification_tab():
             st.success(f"✅ Classification complete! {len(st.session_state.probability_maps)} probability maps available. Go to **Change Detection** tab to analyze building changes.")
 
 
+def display_interactive_map(first_image_path, last_image_path, first_class, last_class, 
+                            change_mask, first_month, last_month, crop_bounds, original_size):
+    """Display interactive Folium map with all layers - matching old app style"""
+    import folium
+    from folium import plugins
+    import streamlit.components.v1 as components
+    import tempfile
+    import base64
+    from rasterio.warp import calculate_default_transform, reproject, Resampling
+    
+    # Extract years from month names for legend
+    first_year = first_month.split('-')[0] if first_month else "N/A"
+    last_year = last_month.split('-')[0] if last_month else "N/A"
+    
+    st.info("""
+    **Interactive Map Controls:**
+    - Use the **layer control** (top-right) to toggle layers on/off
+    - Click **fullscreen button** (top-left) to expand
+    - **Base layers**: Google Satellite, Google Maps, OpenStreetMap
+    - **Overlays**: Sentinel RGB, Classifications (Green=Before, Red=After), Change Detection (Blue)
+    
+    ⚠️ **Note**: Base layer tiles require internet connection. Overlay data is embedded and will remain visible offline.
+    """)
+    
+    try:
+        # Get georeferencing info from first image
+        if not first_image_path or not os.path.exists(first_image_path):
+            st.warning("Cannot create interactive map: source image not found")
+            return
+        
+        with rasterio.open(first_image_path) as src:
+            utm_crs = src.crs
+            utm_transform = src.transform
+            utm_bounds = src.bounds
+            utm_height = src.height
+            utm_width = src.width
+            
+            # Calculate center for map
+            center_x = (utm_bounds.left + utm_bounds.right) / 2
+            center_y = (utm_bounds.bottom + utm_bounds.top) / 2
+        
+        # Reproject center to WGS84
+        from rasterio.warp import transform as rio_transform
+        center_lon, center_lat = rio_transform(utm_crs, 'EPSG:4326', [center_x], [center_y])
+        center = [center_lat[0], center_lon[0]]
+        
+        temp_dir = tempfile.mkdtemp()
+        dst_crs = 'EPSG:4326'
+        
+        # Variables to store reprojected paths and target transform
+        target_transform = None
+        target_width = None
+        target_height = None
+        target_bounds = None
+        
+        before_class_wgs84_path = None
+        after_class_wgs84_path = None
+        change_mask_wgs84_path = None
+        before_rgb_wgs84_path = None
+        after_rgb_wgs84_path = None
+        
+        # Helper function to reproject single band data
+        def reproject_to_wgs84(data, data_name, dtype='uint8'):
+            nonlocal target_transform, target_width, target_height, target_bounds
+            
+            utm_path = os.path.join(temp_dir, f"{data_name}_utm.tif")
+            wgs84_path = os.path.join(temp_dir, f"{data_name}_wgs84.tif")
+            
+            # Save as UTM GeoTIFF
+            with rasterio.open(
+                utm_path, 'w', driver='GTiff',
+                height=data.shape[0], width=data.shape[1],
+                count=1, dtype=dtype, crs=utm_crs, transform=utm_transform
+            ) as dst:
+                dst.write(data.astype(dtype), 1)
+            
+            # Reproject to WGS84
+            with rasterio.open(utm_path) as src_utm:
+                if target_transform is None:
+                    # Calculate target transform once
+                    target_transform, target_width, target_height = calculate_default_transform(
+                        src_utm.crs, dst_crs, src_utm.width, src_utm.height, *src_utm.bounds
+                    )
+                
+                dst_kwargs = src_utm.meta.copy()
+                dst_kwargs.update({
+                    'crs': dst_crs,
+                    'transform': target_transform,
+                    'width': target_width,
+                    'height': target_height
+                })
+                
+                with rasterio.open(wgs84_path, 'w', **dst_kwargs) as dst_wgs:
+                    reproject(
+                        source=rasterio.band(src_utm, 1),
+                        destination=rasterio.band(dst_wgs, 1),
+                        src_transform=src_utm.transform,
+                        src_crs=src_utm.crs,
+                        dst_transform=target_transform,
+                        dst_crs=dst_crs,
+                        resampling=Resampling.nearest
+                    )
+                    if target_bounds is None:
+                        target_bounds = dst_wgs.bounds
+            
+            return wgs84_path
+        
+        # Helper function to reproject RGB data
+        def reproject_rgb_to_wgs84(rgb_data, data_name):
+            nonlocal target_transform, target_width, target_height, target_bounds
+            
+            utm_path = os.path.join(temp_dir, f"{data_name}_utm.tif")
+            wgs84_path = os.path.join(temp_dir, f"{data_name}_wgs84.tif")
+            
+            # Save as UTM GeoTIFF (3 bands)
+            with rasterio.open(
+                utm_path, 'w', driver='GTiff',
+                height=rgb_data.shape[0], width=rgb_data.shape[1],
+                count=3, dtype='uint8', crs=utm_crs, transform=utm_transform
+            ) as dst:
+                for i in range(3):
+                    dst.write(rgb_data[:, :, i], i + 1)
+            
+            # Reproject to WGS84
+            with rasterio.open(utm_path) as src_utm:
+                if target_transform is None:
+                    target_transform, target_width, target_height = calculate_default_transform(
+                        src_utm.crs, dst_crs, src_utm.width, src_utm.height, *src_utm.bounds
+                    )
+                
+                dst_kwargs = src_utm.meta.copy()
+                dst_kwargs.update({
+                    'crs': dst_crs,
+                    'transform': target_transform,
+                    'width': target_width,
+                    'height': target_height
+                })
+                
+                with rasterio.open(wgs84_path, 'w', **dst_kwargs) as dst_wgs:
+                    for i in range(1, 4):
+                        reproject(
+                            source=rasterio.band(src_utm, i),
+                            destination=rasterio.band(dst_wgs, i),
+                            src_transform=src_utm.transform,
+                            src_crs=src_utm.crs,
+                            dst_transform=target_transform,
+                            dst_crs=dst_crs,
+                            resampling=Resampling.bilinear
+                        )
+                    if target_bounds is None:
+                        target_bounds = dst_wgs.bounds
+            
+            return wgs84_path
+        
+        # Helper function to convert raster to Folium overlay
+        def raster_to_folium_overlay(raster_path, colormap='viridis', opacity=0.7, 
+                                     is_binary=False, is_change_mask=False, is_rgb=False):
+            with rasterio.open(raster_path) as src:
+                bounds = src.bounds
+                bounds_latlon = [[bounds.bottom, bounds.left], [bounds.top, bounds.right]]
+                
+                if is_rgb and src.count >= 3:
+                    # RGB image
+                    rgb_data = src.read([1, 2, 3])
+                    img_array = np.transpose(rgb_data, (1, 2, 0))
+                    pil_img = Image.fromarray(img_array.astype(np.uint8))
+                elif is_binary:
+                    # Binary classification mask
+                    data = src.read(1)
+                    rgba_array = np.zeros((data.shape[0], data.shape[1], 4), dtype=np.uint8)
+                    mask_val = data > 0
+                    if colormap == 'Greens':
+                        rgba_array[mask_val, 0:3] = [0, 255, 0]  # Green
+                    elif colormap == 'Reds':
+                        rgba_array[mask_val, 0:3] = [255, 0, 0]  # Red
+                    rgba_array[mask_val, 3] = 180  # Alpha
+                    pil_img = Image.fromarray(rgba_array, 'RGBA')
+                elif is_change_mask:
+                    # Change detection mask - DARK BLUE for better contrast
+                    data = src.read(1)
+                    rgba_array = np.zeros((data.shape[0], data.shape[1], 4), dtype=np.uint8)
+                    mask_val = data > 0
+                    rgba_array[mask_val, 0:3] = [0, 0, 180]  # Dark blue RGB
+                    rgba_array[mask_val, 3] = 220  # Higher opacity for visibility
+                    pil_img = Image.fromarray(rgba_array, 'RGBA')
+                else:
+                    # Single band with colormap
+                    data = src.read(1)
+                    import matplotlib.cm as cm
+                    data_min, data_max = np.nanmin(data), np.nanmax(data)
+                    if data_max > data_min:
+                        data_norm = (data - data_min) / (data_max - data_min)
+                    else:
+                        data_norm = np.zeros_like(data)
+                    cmap_func = cm.get_cmap(colormap)
+                    img_array = cmap_func(data_norm)
+                    img_array = (img_array[:, :, :3] * 255).astype(np.uint8)
+                    pil_img = Image.fromarray(img_array)
+                
+                img_buffer = BytesIO()
+                pil_img.save(img_buffer, format='PNG')
+                img_str = base64.b64encode(img_buffer.getvalue()).decode()
+                return f"data:image/png;base64,{img_str}", bounds_latlon
+        
+        # Reproject classification masks
+        if first_class is not None:
+            first_class_binary = (first_class > 0).astype(np.uint8)
+            before_class_wgs84_path = reproject_to_wgs84(first_class_binary, f"before_class_{first_month}")
+        
+        if last_class is not None:
+            last_class_binary = (last_class > 0).astype(np.uint8)
+            after_class_wgs84_path = reproject_to_wgs84(last_class_binary, f"after_class_{last_month}")
+        
+        # Reproject change mask
+        if change_mask is not None:
+            change_mask_wgs84_path = reproject_to_wgs84(change_mask.astype(np.uint8), "change_mask")
+        
+        # Generate and reproject RGB images
+        first_rgb = generate_rgb_from_sentinel(first_image_path)
+        last_rgb = generate_rgb_from_sentinel(last_image_path) if last_image_path else None
+        
+        if first_rgb is not None:
+            before_rgb_wgs84_path = reproject_rgb_to_wgs84(first_rgb, f"before_rgb_{first_month}")
+        
+        if last_rgb is not None:
+            after_rgb_wgs84_path = reproject_rgb_to_wgs84(last_rgb, f"after_rgb_{last_month}")
+        
+        # Calculate bounds for map initialization (prevents reset on internet loss)
+        if target_bounds:
+            map_bounds = [[target_bounds.bottom, target_bounds.left], 
+                         [target_bounds.top, target_bounds.right]]
+            # Calculate appropriate zoom level based on bounds
+            lat_diff = target_bounds.top - target_bounds.bottom
+            lon_diff = target_bounds.right - target_bounds.left
+            max_diff = max(lat_diff, lon_diff)
+            # Approximate zoom level calculation
+            if max_diff > 1:
+                zoom_level = 8
+            elif max_diff > 0.5:
+                zoom_level = 10
+            elif max_diff > 0.1:
+                zoom_level = 12
+            elif max_diff > 0.05:
+                zoom_level = 14
+            else:
+                zoom_level = 15
+        else:
+            map_bounds = None
+            zoom_level = 15
+        
+        # Create Folium map with explicit bounds to prevent reset
+        m = folium.Map(
+            location=center, 
+            zoom_start=zoom_level, 
+            tiles=None,
+            # These options help stabilize the map
+            prefer_canvas=True,
+            zoom_control=True,
+            scrollWheelZoom=True,
+            dragging=True
+        )
+        
+        # Add fullscreen control
+        plugins.Fullscreen(
+            position='topleft',
+            title='Expand to fullscreen',
+            title_cancel='Exit fullscreen',
+            force_separate_button=True
+        ).add_to(m)
+        
+        # BASE LAYERS - mutually exclusive background layers
+        # Google Satellite with year in name
+        folium.TileLayer(
+            tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+            attr='Google Satellite',
+            name=f'Google Satellite ({last_year})',
+            overlay=False,
+            control=True
+        ).add_to(m)
+        
+        # Google Maps
+        folium.TileLayer(
+            tiles='https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',
+            attr='Google Maps',
+            name='Google Maps',
+            overlay=False,
+            control=True
+        ).add_to(m)
+        
+        # OpenStreetMap
+        folium.TileLayer(
+            tiles='OpenStreetMap',
+            name='OpenStreetMap',
+            overlay=False,
+            control=True
+        ).add_to(m)
+        
+        # OVERLAY LAYERS - stack on top of base layers
+        # Sentinel RGB layers
+        if before_rgb_wgs84_path:
+            try:
+                img_data, bounds = raster_to_folium_overlay(before_rgb_wgs84_path, is_rgb=True)
+                folium.raster_layers.ImageOverlay(
+                    image=img_data,
+                    bounds=bounds,
+                    opacity=0.8,
+                    name=f"First Sentinel-2 RGB ({first_month})",
+                    overlay=True,
+                    control=True,
+                    show=False
+                ).add_to(m)
+            except Exception as e:
+                st.warning(f"Could not add first Sentinel RGB layer: {e}")
+        
+        if after_rgb_wgs84_path:
+            try:
+                img_data, bounds = raster_to_folium_overlay(after_rgb_wgs84_path, is_rgb=True)
+                folium.raster_layers.ImageOverlay(
+                    image=img_data,
+                    bounds=bounds,
+                    opacity=0.8,
+                    name=f"Last Sentinel-2 RGB ({last_month})",
+                    overlay=True,
+                    control=True,
+                    show=False
+                ).add_to(m)
+            except Exception as e:
+                st.warning(f"Could not add last Sentinel RGB layer: {e}")
+        
+        # Classification layers
+        if before_class_wgs84_path:
+            try:
+                img_data, bounds = raster_to_folium_overlay(
+                    before_class_wgs84_path, colormap='Greens', is_binary=True
+                )
+                folium.raster_layers.ImageOverlay(
+                    image=img_data,
+                    bounds=bounds,
+                    opacity=0.7,
+                    name=f"First Classification ({first_month}) - Green",
+                    overlay=True,
+                    control=True,
+                    show=True
+                ).add_to(m)
+            except Exception as e:
+                st.warning(f"Could not add first classification layer: {e}")
+        
+        if after_class_wgs84_path:
+            try:
+                img_data, bounds = raster_to_folium_overlay(
+                    after_class_wgs84_path, colormap='Reds', is_binary=True
+                )
+                folium.raster_layers.ImageOverlay(
+                    image=img_data,
+                    bounds=bounds,
+                    opacity=0.7,
+                    name=f"Last Classification ({last_month}) - Red",
+                    overlay=True,
+                    control=True,
+                    show=True
+                ).add_to(m)
+            except Exception as e:
+                st.warning(f"Could not add last classification layer: {e}")
+        
+        # Change detection mask (top overlay) - DARK BLUE
+        if change_mask_wgs84_path:
+            try:
+                img_data, bounds = raster_to_folium_overlay(
+                    change_mask_wgs84_path, is_change_mask=True
+                )
+                folium.raster_layers.ImageOverlay(
+                    image=img_data,
+                    bounds=bounds,
+                    opacity=0.8,
+                    name=f"Change Detection ({first_month} → {last_month}) - Blue",
+                    overlay=True,
+                    control=True,
+                    show=True
+                ).add_to(m)
+            except Exception as e:
+                st.warning(f"Could not add change detection layer: {e}")
+        
+        # Fit map to bounds and set max bounds to prevent excessive panning
+        if target_bounds:
+            m.fit_bounds([[target_bounds.bottom, target_bounds.left], 
+                         [target_bounds.top, target_bounds.right]])
+            # Add a slight padding to max bounds
+            padding = 0.01  # degrees
+            m.options['maxBounds'] = [
+                [target_bounds.bottom - padding, target_bounds.left - padding],
+                [target_bounds.top + padding, target_bounds.right + padding]
+            ]
+        
+        # Add layer control
+        folium.LayerControl(position='topright', collapsed=False).add_to(m)
+        
+        # Add custom JavaScript to prevent map reset on tile load errors
+        custom_js = f"""
+        <script>
+        document.addEventListener('DOMContentLoaded', function() {{
+            // Store initial view
+            var initialCenter = [{center[0]}, {center[1]}];
+            var initialZoom = {zoom_level};
+            
+            // Find the map object
+            setTimeout(function() {{
+                var maps = document.querySelectorAll('.folium-map');
+                maps.forEach(function(mapEl) {{
+                    if (mapEl._leaflet_map) {{
+                        var map = mapEl._leaflet_map;
+                        
+                        // Prevent tile errors from affecting map state
+                        map.on('tileerror', function(e) {{
+                            console.log('Tile error (ignored):', e);
+                        }});
+                        
+                        // Store current view on every move
+                        var lastCenter = map.getCenter();
+                        var lastZoom = map.getZoom();
+                        
+                        map.on('moveend', function() {{
+                            lastCenter = map.getCenter();
+                            lastZoom = map.getZoom();
+                        }});
+                    }}
+                }});
+            }}, 1000);
+        }});
+        </script>
+        """
+        m.get_root().html.add_child(folium.Element(custom_js))
+        
+        # Display the map using components.html
+        map_html = m.get_root().render()
+        components.html(map_html, height=600)
+        
+        st.caption(f"""
+        **Layer Legend:**
+        - 🟢 **Green**: First month classification ({first_month}) - buildings at start
+        - 🔴 **Red**: Last month classification ({last_month}) - buildings at end
+        - 🔵 **Blue**: Change detection (new buildings detected)
+        
+        **Base Layers:**
+        - Google Satellite ({last_year}): Satellite imagery (approximate year based on data availability)
+        - Google Maps: Street map with labels
+        - OpenStreetMap: Community-maintained map
+        
+        *Note: Base layer tiles require internet. Overlay data (classifications, change detection) is embedded and remains visible offline.*
+        """)
+        
+    except Exception as e:
+        st.error(f"Error creating interactive map: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+
 def change_detection_tab():
     """Change Detection Analysis Tab"""
     st.title("🔍 Change Detection Analysis")
@@ -2478,6 +2934,18 @@ Results:
                     file_name=f"change_detection_report_{first_month}_to_{last_month}.txt",
                     mime="text/plain"
                 )
+            
+            # =================================================================
+            # INTERACTIVE MAP
+            # =================================================================
+            st.divider()
+            st.subheader("🗺️ Interactive Map")
+            
+            display_interactive_map(
+                first_image_path, last_image_path,
+                first_class, last_class, change_mask,
+                first_month, last_month, crop_bounds, original_size
+            )
         
         else:
             st.error("❌ Could not generate visualization. RGB images or crop bounds not available.")
