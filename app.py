@@ -106,7 +106,7 @@ CDI_THRESHOLD = -0.5
 cloudy_pct = 10
 
 # Gap-filling threshold
-MAX_MASKED_PERCENT_FOR_GAPFILL = 30
+MAX_MASKED_PERCENT_FOR_GAPFILL = 20
 
 # Zero-value preprocessing thresholds
 ZERO_VALUE_REPLACEMENT = 1e-5  # Value to add to zero pixels
