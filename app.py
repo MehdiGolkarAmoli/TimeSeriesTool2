@@ -108,8 +108,8 @@ CDI_THRESHOLD = -0.5
 MAX_MASKED_PERCENT_FOR_GAPFILL = 30
 
 # Zero-value preprocessing thresholds
-ZERO_VALUE_REPLACEMENT = 1e-4  # Value to add to zero pixels
-MAX_ZERO_PERCENT = 2.0  # Maximum percentage of zeros allowed (2%)
+ZERO_VALUE_REPLACEMENT = 1e-5  # Value to add to zero pixels
+MAX_ZERO_PERCENT = 1.0  # Maximum percentage of zeros allowed (2%)
 
 # Status constants
 STATUS_NO_DATA = "no_data"
