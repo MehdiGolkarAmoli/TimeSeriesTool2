@@ -2664,13 +2664,13 @@ def change_detection_tab():
         st.subheader("📊 Thresholds")
         non_building_thr = st.text_input(
             "Non-building threshold",
-            value="0.2",
+            value="0.1",
             help="Pixels with probability BELOW this value are considered non-building (0.0 - 0.5)",
             key="cd_non_building_thr"
         )
         building_thr = st.text_input(
             "Building threshold",
-            value="0.8",
+            value="0.9",
             help="Pixels with probability ABOVE this value are considered building (0.5 - 1.0)",
             key="cd_building_thr"
         )
