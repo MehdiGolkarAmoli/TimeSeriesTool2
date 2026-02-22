@@ -1821,17 +1821,7 @@ def main():
 
 
 def main_classification_tab():
-    """Main classification tab content"""
-    st.title("🏗️ Building Classification v06 + Zero-Value Preprocessing")
-    st.markdown("""
-    | Status | Condition | Download? |
-    |--------|-----------|-----------|
-    | `no_data` | No images | ❌ |
-    | `skipped` | masked > 30% | ❌ |
-    | `complete` | masked == 0% | ✅ (+ zero check: reject if >2% zeros) |
-    | `rejected` | masked > 0% after gap-fill OR >2% zeros | ❌ |
-    """)
-    
+       
     ee_ok, ee_msg = initialize_earth_engine()
     if not ee_ok:
         st.error(ee_msg)
