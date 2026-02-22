@@ -103,6 +103,7 @@ MIN_MULTIBAND_FILE_SIZE = 100000
 # Cloud masking thresholds (from JS)
 CLOUD_PROB_THRESHOLD = 50
 CDI_THRESHOLD = -0.5
+cloudy_pct = 10
 
 # Gap-filling threshold
 MAX_MASKED_PERCENT_FOR_GAPFILL = 30
