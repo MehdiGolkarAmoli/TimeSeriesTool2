@@ -1847,15 +1847,7 @@ def main_classification_tab():
             st.stop()
     else:
         st.sidebar.success("✅ Model loaded")
-    
-    # Parameters
-    st.sidebar.header("⚙️ Parameters")
-    cloudy_pct = st.sidebar.slider(
-        "Max Cloud % (metadata)", 0, 50, 10, 5,
-        help="GEE: Filter images by CLOUDY_PIXEL_PERCENTAGE metadata before cloud masking",
-        disabled=st.session_state.processing_in_progress
-    )
-    # Nodata % is now fixed at 0 (removed slider per user request)
+
     nodata_pct = 0
     
     # Cache Status
