@@ -898,7 +898,7 @@ def find_common_valid_patches(downloaded_images, nodata_threshold_percent=0):
     Find patches that are valid and EXCLUDE months that don't have all valid patches.
     
     NEW LOGIC:
-    1. Calculate validity mask for each month
+    1. Calculate the validity mask for each month
     2. Find the month with the MOST valid patches (reference)
     3. Use that reference mask as the "expected" valid patches
     4. Exclude any month that doesn't have ALL those patches valid
@@ -1829,7 +1829,6 @@ def main_classification_tab():
     st.sidebar.success(ee_msg)
     
     # Model
-    st.sidebar.header("🧠 Model")
     model_path = "best_model_version_Unet++_v02_e7.pt"
     
     if not os.path.exists(model_path):
