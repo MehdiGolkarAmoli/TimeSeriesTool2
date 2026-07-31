@@ -1751,6 +1751,17 @@ def get_image_download_data(image_path, month_name):
         return None
 
 
+def get_classification_download_data(classification_pil_image, month_name):
+    """Convert classification PIL image to PNG bytes for download."""
+    try:
+        buf = BytesIO()
+        classification_pil_image.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as e:
+        st.warning(f"Error preparing classification image for {month_name}: {e}")
+        return None
+
+
 def display_thumbnails(thumbnails, valid_months=None):
     if not thumbnails:
         return
@@ -1781,6 +1792,16 @@ def display_thumbnails(thumbnails, valid_months=None):
                                 key=f"dl_sidebyside_{t['month_name']}"
                             )
                     cols[j*2+1].image(t['classification_image'], caption=f"{t['month_name']} ({pct:.1f}%)")
+                    # Add download button under classification image
+                    class_image_data = get_classification_download_data(t['classification_image'], t['month_name'])
+                    if class_image_data:
+                        cols[j*2+1].download_button(
+                            label=f"⬇️ Download {t['month_name']}",
+                            data=class_image_data,
+                            file_name=f"classified_{t['month_name']}.png",
+                            mime="image/png",
+                            key=f"dl_class_sidebyside_{t['month_name']}"
+                        )
     else:
         key = 'classification_image' if mode == "Classification" else 'rgb_image'
         for row in range((len(thumbnails) + 3) // 4):
@@ -1804,6 +1825,17 @@ def display_thumbnails(thumbnails, valid_months=None):
                                     file_name=f"sentinel2_{t['month_name']}_12bands.tif",
                                     mime="image/tiff",
                                     key=f"dl_rgb_{t['month_name']}"
+                                )
+                        # Add download button under classification images only
+                        if mode == "Classification":
+                            class_image_data = get_classification_download_data(t['classification_image'], t['month_name'])
+                            if class_image_data:
+                                cols[c].download_button(
+                                    label=f"⬇️ Download",
+                                    data=class_image_data,
+                                    file_name=f"classified_{t['month_name']}.png",
+                                    mime="image/png",
+                                    key=f"dl_class_grid_{t['month_name']}"
                                 )
 
 
