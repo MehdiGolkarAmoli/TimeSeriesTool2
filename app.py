@@ -1751,14 +1751,62 @@ def get_image_download_data(image_path, month_name):
         return None
 
 
-def get_classification_download_data(classification_pil_image, month_name):
-    """Convert classification PIL image to PNG bytes for download."""
+def get_classification_geotiff_wgs84(prob_map, source_image_path, month_name):
+    """
+    Build a georeferenced classification GeoTIFF (binary building mask),
+    reprojected to WGS84 (EPSG:4326) using the source Sentinel-2 image's
+    CRS/transform, and return the file bytes for download.
+    """
     try:
-        buf = BytesIO()
-        classification_pil_image.save(buf, format="PNG")
-        return buf.getvalue()
+        from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+        with rasterio.open(source_image_path) as src:
+            src_crs = src.crs
+            src_transform = src.transform
+
+        # Binary building mask (0 / 255) at full source resolution
+        class_mask = (prob_map > 0.5).astype(np.uint8) * 255
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            native_path = os.path.join(tmp_dir, f"{month_name}_native.tif")
+            wgs84_path = os.path.join(tmp_dir, f"{month_name}_wgs84.tif")
+
+            # Write classification mask in the source raster's native CRS
+            with rasterio.open(
+                native_path, 'w', driver='GTiff',
+                height=class_mask.shape[0], width=class_mask.shape[1],
+                count=1, dtype='uint8', crs=src_crs, transform=src_transform
+            ) as dst:
+                dst.write(class_mask, 1)
+
+            # Reproject to WGS84 (EPSG:4326)
+            with rasterio.open(native_path) as src_native:
+                dst_transform, dst_width, dst_height = calculate_default_transform(
+                    src_native.crs, 'EPSG:4326', src_native.width, src_native.height, *src_native.bounds
+                )
+                dst_kwargs = src_native.meta.copy()
+                dst_kwargs.update({
+                    'crs': 'EPSG:4326',
+                    'transform': dst_transform,
+                    'width': dst_width,
+                    'height': dst_height
+                })
+
+                with rasterio.open(wgs84_path, 'w', **dst_kwargs) as dst_wgs:
+                    reproject(
+                        source=rasterio.band(src_native, 1),
+                        destination=rasterio.band(dst_wgs, 1),
+                        src_transform=src_native.transform,
+                        src_crs=src_native.crs,
+                        dst_transform=dst_transform,
+                        dst_crs='EPSG:4326',
+                        resampling=Resampling.nearest
+                    )
+
+            with open(wgs84_path, 'rb') as f:
+                return f.read()
     except Exception as e:
-        st.warning(f"Error preparing classification image for {month_name}: {e}")
+        st.warning(f"Error preparing georeferenced classification image for {month_name}: {e}")
         return None
 
 
@@ -1792,16 +1840,19 @@ def display_thumbnails(thumbnails, valid_months=None):
                                 key=f"dl_sidebyside_{t['month_name']}"
                             )
                     cols[j*2+1].image(t['classification_image'], caption=f"{t['month_name']} ({pct:.1f}%)")
-                    # Add download button under classification image
-                    class_image_data = get_classification_download_data(t['classification_image'], t['month_name'])
-                    if class_image_data:
-                        cols[j*2+1].download_button(
-                            label=f"⬇️ Download {t['month_name']}",
-                            data=class_image_data,
-                            file_name=f"classified_{t['month_name']}.png",
-                            mime="image/png",
-                            key=f"dl_class_sidebyside_{t['month_name']}"
-                        )
+                    # Add download button under classification image (georeferenced, WGS84/EPSG:4326)
+                    if valid_months and t['month_name'] in valid_months and t['month_name'] in st.session_state.probability_maps:
+                        source_path = valid_months[t['month_name']]
+                        prob_map = st.session_state.probability_maps[t['month_name']]
+                        class_geotiff_data = get_classification_geotiff_wgs84(prob_map, source_path, t['month_name'])
+                        if class_geotiff_data:
+                            cols[j*2+1].download_button(
+                                label=f"⬇️ Download {t['month_name']}",
+                                data=class_geotiff_data,
+                                file_name=f"classified_{t['month_name']}_wgs84.tif",
+                                mime="image/tiff",
+                                key=f"dl_class_sidebyside_{t['month_name']}"
+                            )
     else:
         key = 'classification_image' if mode == "Classification" else 'rgb_image'
         for row in range((len(thumbnails) + 3) // 4):
@@ -1826,15 +1877,17 @@ def display_thumbnails(thumbnails, valid_months=None):
                                     mime="image/tiff",
                                     key=f"dl_rgb_{t['month_name']}"
                                 )
-                        # Add download button under classification images only
-                        if mode == "Classification":
-                            class_image_data = get_classification_download_data(t['classification_image'], t['month_name'])
-                            if class_image_data:
+                        # Add download button under classification images only (georeferenced, WGS84/EPSG:4326)
+                        if mode == "Classification" and valid_months and t['month_name'] in valid_months and t['month_name'] in st.session_state.probability_maps:
+                            source_path = valid_months[t['month_name']]
+                            prob_map = st.session_state.probability_maps[t['month_name']]
+                            class_geotiff_data = get_classification_geotiff_wgs84(prob_map, source_path, t['month_name'])
+                            if class_geotiff_data:
                                 cols[c].download_button(
                                     label=f"⬇️ Download",
-                                    data=class_image_data,
-                                    file_name=f"classified_{t['month_name']}.png",
-                                    mime="image/png",
+                                    data=class_geotiff_data,
+                                    file_name=f"classified_{t['month_name']}_wgs84.tif",
+                                    mime="image/tiff",
                                     key=f"dl_class_grid_{t['month_name']}"
                                 )
 
